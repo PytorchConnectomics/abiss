@@ -1,20 +1,25 @@
 from cloudvolume import CloudVolume
+from volume_backends import open_volume
 import chunk_utils as cu
 import numpy
 import os
 
 
 def load_data(url, **kwargs):
-    print("cloud volume url: ", url)
+    print("volume url: ", url)
 
-    return CloudVolume(url, cache=False, **kwargs)
+    # Dispatches on the path: *.h5/*.hdf5 and *.zarr use the local adapters, anything
+    # else (precomputed, gs://, ...) falls through to CloudVolume unchanged. This lets
+    # ABISS read affinity straight out of inference output instead of requiring a
+    # precomputed copy of the whole volume.
+    return open_volume(url, cache=False, **kwargs)
     #return CloudVolumeGSUtil(url, fill_missing=True)
 
 def load_gt_data(url, mip=0):
-    print("cloud volume url: ", url)
+    print("volume url: ", url)
     print("mip level: ", mip)
 
-    return CloudVolume(url, fill_missing=True, bounded=False, mip=mip)
+    return open_volume(url, fill_missing=True, bounded=False, mip=mip)
 
 def save_raw_data(fn, data):
     f = numpy.memmap(fn, dtype=data.dtype, mode='w+', order='F', shape=data.shape)

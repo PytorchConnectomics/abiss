@@ -8,6 +8,10 @@ ENV SEG_USER ${SEG_USER}
 ARG MINICONDA_PATH=/opt/conda
 ARG MINICONDA_URL=https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
 ENV PATH ${MINICONDA_PATH}/bin:${PATH}
+# HDF5 reads this once at library init, so it must be in the environment rather than
+# set by Python. File locking fails on the networked filesystems these jobs read
+# affinity from; scripts/volume_backends.py only ever opens HDF5 read-only.
+ENV HDF5_USE_FILE_LOCKING FALSE
 
 WORKDIR ${SEG_HOME}
 

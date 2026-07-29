@@ -7,6 +7,7 @@ guarded.
 """
 import json
 import os
+import pathlib
 import sys
 
 import numpy as np
@@ -16,8 +17,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cut_chunk_common import convert_and_scale_integer_data  # noqa: E402
 from volume_backends import is_h5_path, is_zarr_path, open_volume  # noqa: E402
 
-h5py = pytest.importorskip("h5py")
-zarr = pytest.importorskip("zarr")
+# NOT importorskip: h5py and zarr are hard requirements of these backends (they are
+# installed in docker/Dockerfile). Skipping on ImportError would turn "the ABISS image
+# forgot a dependency" -- exactly the review_v1 finding -- into a green test run.
+import h5py  # noqa: E402
+import zarr  # noqa: E402
 
 
 def _write_h5(path, arr, dataset="main"):
@@ -176,7 +180,7 @@ def test_path_detection_is_suffix_based(tmp_path):
 def test_zarr_roundtrip_and_default_read_only(tmp_path):
     src = np.random.default_rng(8).random((3, 4, 5, 6)).astype("float32")
     p = tmp_path / "a.zarr"
-    z = zarr.open(str(p), mode="w", shape=src.shape, chunks=src.shape, dtype="float32")
+    z = zarr.open(str(p), mode="w", shape=src.shape, chunks=(3, 2, 2, 2), dtype="float32")
     z[:] = src
     os.environ.pop("PARAM_JSON", None)
     v = open_volume(str(p))
@@ -189,3 +193,117 @@ def test_zarr_roundtrip_and_default_read_only(tmp_path):
     w = open_volume(str(p), writable=True)
     w[0:2, 0:2, 0:2] = np.full((2, 2, 2, 3), 0.25, "float32")
     assert np.allclose(np.asarray(w[0:2, 0:2, 0:2]), 0.25)
+
+
+# --------------------------------------------------------------------------------
+# Production write paths.
+#
+# review_v2 [P1]: making zarr read-only by default broke every real writer, and the
+# adapter-level test missed it because it passed writable=True itself. These assert
+# on the actual writer modules.
+# --------------------------------------------------------------------------------
+
+WRITER_CALLS = [
+    ("cut_chunk_ws.py", "ADJUSTED_AFF_PATH"),
+    ("upload_chunk.py", "sys.argv[2]"),
+    ("upload_size.py", "sys.argv[2]"),
+]
+
+
+@pytest.mark.parametrize("module_name,target", WRITER_CALLS)
+def test_production_writers_open_volumes_writable(module_name, target):
+    """Each writer must opt in to `writable=True` or its first assignment raises."""
+    import re
+
+    src = (pathlib.Path(__file__).parent / module_name).read_text()
+    calls = [m for m in re.findall(r"open_volume\((?:[^()]|\([^()]*\))*\)", src)]
+    assert calls, f"{module_name} no longer calls open_volume"
+    for call in calls:
+        assert "writable=True" in call, (
+            f"{module_name}: {call} opens a WRITE target read-only; the following "
+            f"assignment raises NotImplementedError (target {target})."
+        )
+
+
+def test_writable_zarr_accepts_assignment(tmp_path):
+    """End-to-end of the writer contract: open writable, assign, read back."""
+    path = tmp_path / "out.zarr"
+    zarr.open(str(path), mode="w", shape=(4, 4, 4), chunks=(2, 2, 2), dtype="uint32")
+
+    vol = open_volume(str(path), writable=True)
+    vol[0:2, 0:2, 0:2] = np.full((2, 2, 2), 7, dtype=np.uint32)
+
+    assert np.all(open_volume(str(path))[0:2, 0:2, 0:2] == 7)
+
+
+def test_writable_is_not_forwarded_to_cloudvolume():
+    """`writable` is ours; reaching the CloudVolume constructor is a TypeError."""
+    import inspect
+
+    import volume_backends
+
+    src = inspect.getsource(volume_backends.open_volume)
+    pop_at = src.index('kwargs.pop("writable"')
+    # It must be consumed before either dispatch branch, not inside the zarr branch.
+    assert pop_at < src.index("ZarrVolume(")
+    assert pop_at < src.index("CloudVolume(")
+
+
+# --------------------------------------------------------------------------------
+# aff_t ABI (review_v2 [P2]).
+# --------------------------------------------------------------------------------
+
+
+def test_affinity_dtype_follows_compiled_aff_t(monkeypatch):
+    from cut_chunk_common import affinity_dtype
+
+    monkeypatch.delenv("ABISS_AFF_DTYPE", raising=False)
+    assert affinity_dtype() == "float32"
+
+    monkeypatch.setenv("ABISS_AFF_DTYPE", "float64")  # -DDOUBLE build
+    assert affinity_dtype() == "float64"
+
+    monkeypatch.setenv("ABISS_AFF_DTYPE", "float16")
+    with pytest.raises(ValueError, match="float32 or float64"):
+        affinity_dtype()
+
+
+def test_save_raw_data_writes_the_full_element_width(tmp_path, monkeypatch):
+    """A float16 array must never reach aff.raw at half the expected byte length."""
+    from cut_chunk_common import affinity_dtype, save_raw_data
+
+    monkeypatch.delenv("ABISS_AFF_DTYPE", raising=False)
+    data = np.arange(3 * 4 * 5, dtype="float16").reshape(3, 4, 5)
+    converted = convert_and_scale_integer_data(data, affinity_dtype())
+
+    fn = tmp_path / "aff.raw"
+    save_raw_data(str(fn), converted)
+    assert fn.stat().st_size == data.size * 4
+    assert np.allclose(
+        np.fromfile(fn, dtype="float32").reshape(data.shape, order="F"),
+        data.astype("float32"),
+    )
+
+
+def test_misaligned_writable_zarr_write_is_rejected(tmp_path):
+    """The concurrency precondition is enforced, not just documented."""
+    p = tmp_path / "aligned.zarr"
+    zarr.open(str(p), mode="w", shape=(8, 8, 8), chunks=(4, 4, 4), dtype="uint32")
+    v = open_volume(str(p), writable=True)
+    block = np.ones((4, 4, 4), dtype="uint32")
+
+    v[0:4, 0:4, 0:4] = block  # aligned
+    v[4:8, 4:8, 4:8] = block  # aligned, last block
+
+    with pytest.raises(ValueError, match="not aligned to the storage chunk"):
+        v[1:5, 0:4, 0:4] = block
+
+
+def test_ragged_final_block_is_allowed(tmp_path):
+    """A volume whose extent is not a chunk multiple must still be writable."""
+    p = tmp_path / "ragged.zarr"
+    zarr.open(str(p), mode="w", shape=(6, 6, 6), chunks=(4, 4, 4), dtype="uint32")
+    v = open_volume(str(p), writable=True)
+
+    v[4:6, 4:6, 4:6] = np.ones((2, 2, 2), dtype="uint32")  # stops at the volume edge
+    assert np.all(np.asarray(open_volume(str(p))[4:6, 4:6, 4:6]) == 1)

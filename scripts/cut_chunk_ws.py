@@ -33,7 +33,7 @@ if "SEM_PATH" in global_param and global_param.get("SEMANTIC_WS", False):
     aff_cutout = mask_affinity_with_semantic_labels(aff_cutout, sem, bbox, boundary_flags, 1, 1)
 
 if 'ADJUSTED_AFF_PATH' in global_param:
-    vol = open_volume(global_param['ADJUSTED_AFF_PATH'], mip=global_param['AFF_RESOLUTION'], cdn_cache=False)
+    vol = open_volume(global_param['ADJUSTED_AFF_PATH'], mip=global_param['AFF_RESOLUTION'], cdn_cache=False, writable=True)
     vol[bbox[0]:bbox[3], bbox[1]:bbox[4], bbox[2]:bbox[5], :] = aff_cutout[1:-1, 1:-1, 1:-1, :]
 
 save_raw_data("aff.raw", aff_cutout)

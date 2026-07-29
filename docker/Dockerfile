@@ -8,6 +8,10 @@ ENV SEG_USER ${SEG_USER}
 ARG MINICONDA_PATH=/opt/conda
 ARG MINICONDA_URL=https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
 ENV PATH ${MINICONDA_PATH}/bin:${PATH}
+# HDF5 reads this once at library init, so it must be in the environment rather than
+# set by Python. File locking fails on the networked filesystems these jobs read
+# affinity from; scripts/volume_backends.py only ever opens HDF5 read-only.
+ENV HDF5_USE_FILE_LOCKING FALSE
 
 WORKDIR ${SEG_HOME}
 
@@ -48,6 +52,9 @@ RUN savedAptMark="$(apt-mark showmanual)" \
     && pip install --no-cache-dir -U pip \
     && pip install --no-cache-dir -U git+https://github.com/seung-lab/chunk_iterator#egg=chunk-iterator \
     && pip install --no-cache-dir -U cloud-volume \
+    # h5py/zarr back scripts/volume_backends.py, which lets ABISS read affinity
+    # straight out of an HDF5/zarr instead of a precomputed copy of the volume.
+    && pip install --no-cache-dir -U h5py zarr \
     && pip install --no-cache-dir -U cloud-files \
     && cd ${SEG_HOME} \
     && git clone --depth 1 https://github.com/abseil/abseil-cpp.git \

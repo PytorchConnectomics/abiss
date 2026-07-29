@@ -3,6 +3,7 @@ import numpy as np
 import chunk_utils as cu
 import os
 from cloudvolume import CloudVolume
+from volume_backends import open_volume
 
 param = cu.read_inputs(sys.argv[1])
 global_param = cu.read_inputs(os.environ['PARAM_JSON'])
@@ -12,5 +13,5 @@ print(fn)
 bbox = param["bbox"]
 sizes = tuple([bbox[i+3]-bbox[i] for i in range(3)])
 fp = np.memmap(fn, dtype=np.uint8, mode='r', shape=sizes, order='F')
-vol = CloudVolume(sys.argv[2], mip=global_param['AFF_RESOLUTION'], cdn_cache=False)
+vol = open_volume(sys.argv[2], mip=global_param['AFF_RESOLUTION'], cdn_cache=False, writable=True)
 vol[bbox[0]:bbox[3], bbox[1]:bbox[4], bbox[2]:bbox[5]] = fp[:]

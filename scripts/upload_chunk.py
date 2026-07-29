@@ -3,6 +3,7 @@ import os
 import numpy as np
 import chunk_utils as cu
 from cloudvolume import CloudVolume
+from volume_backends import open_volume
 
 param = cu.read_inputs(sys.argv[1])
 global_param = cu.read_inputs(os.environ['PARAM_JSON'])
@@ -18,5 +19,5 @@ if global_param.get("REMOVE_SMALL_SEGMENTS", False) and os.environ["STAGE"] == "
     fp_size = np.memmap(fn_size, dtype=np.uint8, mode='r', shape=sizes, order='F')
     data_size = np.array(fp_size[:])
     data[data_size > 0] = 0
-vol = CloudVolume(sys.argv[2], mip=global_param['AFF_RESOLUTION'], cdn_cache=False)
+vol = open_volume(sys.argv[2], mip=global_param['AFF_RESOLUTION'], cdn_cache=False, writable=True)
 vol[bbox[0]:bbox[3], bbox[1]:bbox[4], bbox[2]:bbox[5]] = data[:]

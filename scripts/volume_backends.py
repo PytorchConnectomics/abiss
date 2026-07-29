@@ -220,6 +220,12 @@ class _ArrayVolume(object):
         block = np.asarray(block)
         if block.ndim == 3:  # a single channel was selected by an int
             block = block[np.newaxis, ...]
+        if self._restore_scale is not None:
+            # Undoing scale_sigmoid is a property of how the affinity was WRITTEN, not
+            # of the edge convention. Applying it only on the banis path meant a config
+            # with AFF_RESTORE_SIGMOID and no AFF_CONVENTION silently read compressed
+            # values -- affinity spanning ~0.08 instead of a bimodal 0..1.
+            block = _restore_sigmoid(block.astype(np.float32), self._restore_scale)
         return np.transpose(block, (3, 2, 1, 0))  # -> (X, Y, Z, C)
 
     def _read_banis(self, xs, ys, zs, cs):
@@ -603,7 +609,11 @@ def open_volume(path, **kwargs):
     # Pop before the CloudVolume fallback: `writable` is ours, and forwarding it to
     # the CloudVolume constructor is a TypeError.
     writable = bool(kwargs.pop("writable", False))
-    if convention is None:
+    # Only consult the param file when the CALLER supplied neither. Keying this on
+    # `convention is None` alone silently discarded an explicit restore_sigmoid_scale
+    # whenever convention was omitted, so the caller got raw stored values while
+    # believing they were restored.
+    if convention is None and restore is None:
         convention, restore = _affinity_conversion_for(text)
     if is_h5_path(text) or is_zarr_path(text) or is_h5_chunkstore_path(text):
         # These backends expose a single scale. Silently ignoring a mip would read

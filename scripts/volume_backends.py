@@ -27,6 +27,9 @@ Concurrency: ABISS runs many chunk workers at once.
     single-writer), so concurrent chunk writes would silently corrupt the file.
     Attempting to write raises instead of quietly producing garbage.
 """
+import collections
+import json
+import re
 import os
 
 # HDF5 reads this during library initialization, so it must be set before h5py (and
@@ -309,6 +312,159 @@ class ZarrVolume(_ArrayVolume):
                 )
 
 
+
+class _ChunkedH5Array(object):
+    """The 726-file grid-1008 affinity store, presented as one (C, Z, Y, X) array.
+
+    Chunked inference writes one HDF5 per grid cell (``chunk_z2_y3_x3.h5``), each
+    holding the halo-trimmed interior. ABISS wants a single volume. Building one
+    would duplicate 2.7 TB -- the exact copy this backend exists to avoid -- so
+    assemble reads on the fly instead.
+
+    Only basic slicing is supported, which is all _ArrayVolume needs; because this
+    sits UNDER _ArrayVolume, the BANIS conversion (including its 1-voxel low-side
+    margin, which may fall in the neighbouring file) works across file seams for
+    free.
+    """
+
+    _NAME_RE = re.compile(r"^chunk_z(\d+)_y(\d+)_x(\d+)\.h5$")
+    _MAX_OPEN = 8
+
+    def __init__(self, directory, dataset=None):
+        import h5py
+
+        self._dir = directory
+        self._dataset = dataset
+        self._h5py = h5py
+        self._open = collections.OrderedDict()
+
+        self._index = {}
+        for name in os.listdir(directory):
+            m = self._NAME_RE.match(name)
+            if m:
+                self._index[tuple(int(v) for v in m.groups())] = os.path.join(directory, name)
+        if not self._index:
+            raise ValueError("%s: no chunk_z*_y*_x*.h5 files found" % directory)
+
+        probe_key = min(self._index)
+        with h5py.File(self._index[probe_key], "r") as f:
+            if self._dataset is None:
+                names = [k for k in f if isinstance(f[k], h5py.Dataset)]
+                if len(names) != 1:
+                    raise ValueError(
+                        "%s: expected exactly one dataset per chunk, got %r" % (directory, names)
+                    )
+                self._dataset = names[0]
+            ds = f[self._dataset]
+            if ds.ndim != 4:
+                raise ValueError(
+                    "%s: expected (C, Z, Y, X) chunks, got %r" % (directory, ds.shape)
+                )
+            self._channels = int(ds.shape[0])
+            self._cshape = tuple(int(v) for v in ds.shape[1:])  # (Z, Y, X)
+            self.dtype = ds.dtype
+            # Placement is derived from the filename grid index; the attrs are
+            # authoritative, so verify the two agree rather than trusting the name.
+            start = ds.attrs.get("chunk_start_zyx")
+            if start is not None:
+                expected = [probe_key[i] * self._cshape[i] for i in range(3)]
+                got = json.loads(str(start))
+                if list(got) != expected:
+                    raise ValueError(
+                        "%s: chunk_start_zyx %r does not match grid index %r x chunk "
+                        "shape %r; the filename grid is not the storage layout."
+                        % (directory, got, probe_key, self._cshape)
+                    )
+
+        grid = [max(k[i] for k in self._index) + 1 for i in range(3)]
+        self._grid = tuple(grid)
+        self.shape = (self._channels,) + tuple(
+            grid[i] * self._cshape[i] for i in range(3)
+        )
+        self.ndim = 4
+
+    def _handle(self, key):
+        handle = self._open.pop(key, None)
+        if handle is None:
+            handle = self._h5py.File(self._index[key], "r", locking=False)
+            if len(self._open) >= self._MAX_OPEN:
+                _, old = self._open.popitem(last=False)
+                old.close()
+        self._open[key] = handle
+        return handle
+
+    @staticmethod
+    def _bounds(sl, dim):
+        if isinstance(sl, slice):
+            start, stop, step = sl.indices(dim)
+            if step != 1:
+                raise ValueError("strided reads are not supported")
+            return start, stop
+        return sl, sl + 1
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple):
+            key = (key,)
+        key = key + (slice(None),) * (4 - len(key))
+        c0, c1 = self._bounds(key[0], self.shape[0])
+        box = [self._bounds(key[i + 1], self.shape[i + 1]) for i in range(3)]
+
+        out = np.zeros(
+            (c1 - c0,) + tuple(hi - lo for lo, hi in box), dtype=self.dtype
+        )
+        ranges = []
+        for axis, (lo, hi) in enumerate(box):
+            first = lo // self._cshape[axis]
+            last = max(first, (hi - 1) // self._cshape[axis])
+            ranges.append(range(first, last + 1))
+
+        for gz in ranges[0]:
+            for gy in ranges[1]:
+                for gx in ranges[2]:
+                    gk = (gz, gy, gx)
+                    if gk not in self._index:
+                        continue  # absent cell stays zero, like a missing tile
+                    src, dst = [], []
+                    for axis, gi in enumerate(gk):
+                        base = gi * self._cshape[axis]
+                        lo, hi = box[axis]
+                        s0 = max(lo, base)
+                        s1 = min(hi, base + self._cshape[axis])
+                        src.append(slice(s0 - base, s1 - base))
+                        dst.append(slice(s0 - lo, s1 - lo))
+                    ds = self._handle(gk)[self._dataset]
+                    out[:, dst[0], dst[1], dst[2]] = ds[
+                        c0:c1, src[0], src[1], src[2]
+                    ]
+        return out
+
+
+class H5ChunkStoreVolume(_ArrayVolume):
+    """Read-only view over a directory of grid-indexed affinity HDF5 chunks."""
+
+    def __init__(self, path, convention=None, restore_sigmoid_scale=None):
+        raw = _strip_scheme(str(path))
+        dataset = None
+        if "::" in raw:
+            raw, dataset = raw.split("::", 1)
+        array = _ChunkedH5Array(raw, dataset=dataset)
+        super(H5ChunkStoreVolume, self).__init__(
+            array, writable=False, label="h5-chunkstore %s" % raw,
+            convention=convention, restore_sigmoid_scale=restore_sigmoid_scale,
+        )
+
+
+def is_h5_chunkstore_path(path):
+    """A directory holding chunk_z*_y*_x*.h5 files (chunked-inference output)."""
+    raw = _strip_scheme(str(path)).split("::", 1)[0]
+    if not os.path.isdir(raw):
+        return False
+    try:
+        return any(_ChunkedH5Array._NAME_RE.match(n) for n in os.listdir(raw))
+    except OSError:
+        return False
+
+
 def _affinity_conversion_for(path):
     """Convention/restore-scale to apply, from the ABISS param file.
 
@@ -351,7 +507,7 @@ def open_volume(path, **kwargs):
     writable = bool(kwargs.pop("writable", False))
     if convention is None:
         convention, restore = _affinity_conversion_for(text)
-    if is_h5_path(text) or is_zarr_path(text):
+    if is_h5_path(text) or is_zarr_path(text) or is_h5_chunkstore_path(text):
         # These backends expose a single scale. Silently ignoring a mip would read
         # full-resolution voxels while the chunk coordinates refer to another scale,
         # which degrades the segmentation without ever crashing.
@@ -376,6 +532,10 @@ def open_volume(path, **kwargs):
                     "not implement. Remove it, or use a precomputed layer."
                     % (text, name, value)
                 )
+    if is_h5_chunkstore_path(text):
+        return H5ChunkStoreVolume(
+            text, convention=convention, restore_sigmoid_scale=restore
+        )
     if is_h5_path(text):
         return H5Volume(text, convention=convention, restore_sigmoid_scale=restore)
     if is_zarr_path(text):

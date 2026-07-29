@@ -15,7 +15,12 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cut_chunk_common import convert_and_scale_integer_data  # noqa: E402
-from volume_backends import is_h5_path, is_zarr_path, open_volume  # noqa: E402
+from volume_backends import (  # noqa: E402
+    is_h5_chunkstore_path,
+    is_h5_path,
+    is_zarr_path,
+    open_volume,
+)
 
 # NOT importorskip: h5py and zarr are hard requirements of these backends (they are
 # installed in docker/Dockerfile). Skipping on ImportError would turn "the ABISS image
@@ -307,3 +312,84 @@ def test_ragged_final_block_is_allowed(tmp_path):
 
     v[4:6, 4:6, 4:6] = np.ones((2, 2, 2), dtype="uint32")  # stops at the volume edge
     assert np.all(np.asarray(open_volume(str(p))[4:6, 4:6, 4:6]) == 1)
+
+
+# --------------------------------------------------------------------------------
+# Multi-file chunk store: the 726-file grid affinity presented as one volume.
+# --------------------------------------------------------------------------------
+
+
+def _make_chunkstore(tmp_path, grid=(2, 2, 2), cshape=(6, 6, 6), seed=3):
+    """Write a grid of chunk_z*_y*_x*.h5 and return (dir, monolithic array)."""
+    rng = np.random.default_rng(seed)
+    full = rng.random((3,) + tuple(g * c for g, c in zip(grid, cshape))).astype("float32")
+    d = tmp_path / "store.h5.chunks"
+    d.mkdir()
+    for gz in range(grid[0]):
+        for gy in range(grid[1]):
+            for gx in range(grid[2]):
+                sl = (
+                    slice(None),
+                    slice(gz * cshape[0], (gz + 1) * cshape[0]),
+                    slice(gy * cshape[1], (gy + 1) * cshape[1]),
+                    slice(gx * cshape[2], (gx + 1) * cshape[2]),
+                )
+                with h5py.File(d / f"chunk_z{gz}_y{gy}_x{gx}.h5", "w") as f:
+                    ds = f.create_dataset("main", data=full[sl])
+                    ds.attrs["chunk_start_zyx"] = str(
+                        [gz * cshape[0], gy * cshape[1], gx * cshape[2]]
+                    )
+    return d, full
+
+
+def test_chunkstore_is_detected_and_shaped_like_the_whole_grid(tmp_path):
+    d, full = _make_chunkstore(tmp_path)
+    assert is_h5_chunkstore_path(str(d))
+    assert not is_h5_path(str(d))  # a directory is not a single-file h5
+
+    vol = open_volume(str(d))
+    zdim, ydim, xdim = full.shape[1:]
+    assert vol.shape == (xdim, ydim, zdim, 3)
+
+
+def test_chunkstore_read_matches_the_monolithic_array(tmp_path):
+    """Assembly must be transparent, including boxes spanning several files."""
+    d, full = _make_chunkstore(tmp_path)
+    vol = open_volume(str(d))
+    reference = np.transpose(full, (3, 2, 1, 0))  # (C,Z,Y,X) -> (X,Y,Z,C)
+
+    for box in [
+        (slice(0, 6), slice(0, 6), slice(0, 6)),      # exactly one chunk
+        (slice(3, 9), slice(3, 9), slice(3, 9)),      # straddles all three seams
+        (slice(0, 12), slice(0, 12), slice(0, 12)),   # whole grid
+        (slice(5, 7), slice(5, 7), slice(5, 7)),      # 1 voxel either side of a seam
+    ]:
+        got = np.asarray(vol[box])
+        assert np.allclose(got, reference[box]), f"mismatch on {box}"
+
+
+def test_chunkstore_banis_conversion_crosses_file_seams(tmp_path):
+    """The BANIS 1-voxel low margin may live in the NEIGHBOURING file."""
+    d, full = _make_chunkstore(tmp_path)
+    store = open_volume(str(d), convention="banis")
+    monolithic = open_volume_array_for_test(full)
+
+    box = (slice(6, 10), slice(6, 10), slice(6, 10))  # starts exactly on a seam
+    assert np.allclose(np.asarray(store[box]), np.asarray(monolithic[box]))
+
+
+def open_volume_array_for_test(array):
+    import volume_backends
+
+    return volume_backends._ArrayVolume(
+        array, writable=False, label="monolithic", convention="banis"
+    )
+
+
+def test_chunkstore_rejects_a_grid_that_contradicts_the_attrs(tmp_path):
+    """Filename grid index and chunk_start_zyx must agree, or placement is wrong."""
+    d, _ = _make_chunkstore(tmp_path)
+    with h5py.File(d / "chunk_z0_y0_x0.h5", "a") as f:
+        f["main"].attrs["chunk_start_zyx"] = str([999, 0, 0])
+    with pytest.raises(ValueError, match="does not match grid index"):
+        open_volume(str(d))

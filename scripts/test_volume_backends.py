@@ -393,3 +393,70 @@ def test_chunkstore_rejects_a_grid_that_contradicts_the_attrs(tmp_path):
         f["main"].attrs["chunk_start_zyx"] = str([999, 0, 0])
     with pytest.raises(ValueError, match="does not match grid index"):
         open_volume(str(d))
+
+
+# --------------------------------------------------------------------------------
+# Keep-mask. The uploaded affinity was masked; reading the raw store unmasked cost
+# 0.045 NERL at whole-volume scale (dev/zebrafinch/reports/wholevol_h5_unmasked_0340.md).
+# --------------------------------------------------------------------------------
+
+
+def test_keep_mask_zeroes_all_channels_outside_the_mask(tmp_path):
+    rng = np.random.default_rng(11)
+    data = rng.random((3, 4, 5, 6)).astype("float32") + 0.5  # strictly non-zero
+    path = tmp_path / "aff.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("main", data=data)
+
+    mask = np.ones((4, 5, 6), dtype="uint8")
+    mask[:, :, 3:] = 0  # drop high X
+
+    vol = open_volume(str(path)).attach_keep_mask(mask)
+    out = np.asarray(vol[0:6, 0:5, 0:4])  # (X, Y, Z, C)
+
+    assert np.all(out[3:] == 0), "masked-out region must be zero in every channel"
+    assert np.all(out[:3] > 0), "kept region must be untouched"
+
+
+def test_keep_mask_applies_after_the_banis_shift(tmp_path):
+    """A KEPT voxel must still take its edge from the correct source voxel."""
+    rng = np.random.default_rng(12)
+    data = rng.random((3, 6, 6, 6)).astype("float32") + 0.5
+    path = tmp_path / "aff.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("main", data=data)
+
+    unmasked = np.asarray(open_volume(str(path), convention="banis")[0:6, 0:6, 0:6])
+
+    mask = np.ones((6, 6, 6), dtype="uint8")
+    mask[:, :, 0] = 0  # drop the lowest X plane -- a SOURCE for x=1 under the shift
+    masked = np.asarray(
+        open_volume(str(path), convention="banis").attach_keep_mask(mask)[0:6, 0:6, 0:6]
+    )
+
+    assert np.all(masked[0] == 0)
+    # x=1 keeps its value even though its source voxel x=0 is masked out.
+    assert np.array_equal(masked[1:], unmasked[1:])
+
+
+def test_keep_mask_smaller_than_the_volume_keeps_the_remainder(tmp_path):
+    """A chunk-grid-padded store is larger than the mask; outside == keep."""
+    data = np.ones((3, 4, 4, 8), dtype="float32")
+    path = tmp_path / "aff.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("main", data=data)
+
+    mask = np.zeros((4, 4, 4), dtype="uint8")  # covers only low X half, all dropped
+    out = np.asarray(open_volume(str(path)).attach_keep_mask(mask)[0:8, 0:4, 0:4])
+
+    assert np.all(out[:4] == 0), "masked region dropped"
+    assert np.all(out[4:] == 1), "beyond the mask extent stays kept"
+
+
+def test_keep_mask_larger_than_the_volume_is_rejected(tmp_path):
+    data = np.ones((3, 4, 4, 4), dtype="float32")
+    path = tmp_path / "aff.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("main", data=data)
+    with pytest.raises(ValueError, match="larger than the volume"):
+        open_volume(str(path)).attach_keep_mask(np.ones((9, 9, 9), dtype="uint8"))

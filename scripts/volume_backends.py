@@ -44,8 +44,8 @@ def _strip_scheme(path):
 
 
 def is_zarr_path(path):
-    p = _strip_scheme(str(path))
-    return str(path).startswith("zarr://") or any(s in p for s in _ZARR_SUFFIXES)
+    p = _strip_scheme(str(path)).rstrip("/")
+    return str(path).startswith("zarr://") or p.endswith(_ZARR_SUFFIXES)
 
 
 def is_h5_path(path):
@@ -100,6 +100,16 @@ class _ArrayVolume(object):
         self._restore_scale = restore_sigmoid_scale
         if array.ndim == 4:
             self._channels = int(array.shape[0])
+            if self._convention == "banis" and self._channels != 3:
+                # The conversion reverses the whole channel axis, so a 4-channel
+                # affinity+myelin volume (which ABISS supports) would come out with
+                # myelin in channel 0 and the affinities shifted -- plausible-looking
+                # but wrong. Refuse rather than corrupt.
+                raise ValueError(
+                    "%s: AFF_CONVENTION='banis' requires exactly 3 channels, got %d. "
+                    "Convert the affinity separately, or drop the auxiliary channel."
+                    % (label, self._channels)
+                )
         elif array.ndim == 3:
             self._channels = 1
         else:
@@ -239,10 +249,11 @@ class H5Volume(_ArrayVolume):
 class ZarrVolume(_ArrayVolume):
     """Zarr volume. Concurrent writes are safe only for disjoint chunk-aligned regions."""
 
-    def __init__(self, path, writable=True, convention=None, restore_sigmoid_scale=None):
+    def __init__(self, path, writable=False, convention=None, restore_sigmoid_scale=None):
         import zarr
 
         raw = _strip_scheme(str(path))
+        # mode="a" creates a store on a typo; readers get "r" so a wrong path fails loudly.
         self._array = zarr.open(raw, mode="a" if writable else "r")
         super(ZarrVolume, self).__init__(
             self._array, writable=writable, label="zarr %s" % raw,
@@ -289,12 +300,24 @@ def open_volume(path, **kwargs):
     restore = kwargs.pop("restore_sigmoid_scale", None)
     if convention is None:
         convention, restore = _affinity_conversion_for(text)
+    if is_h5_path(text) or is_zarr_path(text):
+        # These backends expose a single scale. Silently ignoring a mip would read
+        # full-resolution voxels while the chunk coordinates refer to another scale,
+        # which degrades the segmentation without ever crashing.
+        mip = kwargs.get("mip", 0)
+        if isinstance(mip, (list, tuple)):
+            mip = 0 if len(mip) == 3 else mip  # a resolution triple selects scale 0 here
+        if mip not in (0, None):
+            raise ValueError(
+                "%s: mip=%r requested but HDF5/zarr backends are single-scale. "
+                "Set AFF_RESOLUTION to 0 or use a precomputed layer." % (text, mip)
+            )
     if is_h5_path(text):
         return H5Volume(text, convention=convention, restore_sigmoid_scale=restore)
     if is_zarr_path(text):
         return ZarrVolume(
             text,
-            writable=kwargs.pop("writable", True),
+            writable=bool(kwargs.pop("writable", False)),
             convention=convention,
             restore_sigmoid_scale=restore,
         )

@@ -1,0 +1,191 @@
+"""Tests for scripts/volume_backends.py (run: pytest scripts/test_volume_backends.py).
+
+These exercise the ABISS-side adapters directly. A previous version of this work cited
+tests that lived in pytorch_connectomics and only covered an equivalent transform
+there -- they never imported this module, so none of the behaviour below was actually
+guarded.
+"""
+import json
+import os
+import sys
+
+import numpy as np
+import pytest
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from cut_chunk_common import convert_and_scale_integer_data  # noqa: E402
+from volume_backends import is_h5_path, is_zarr_path, open_volume  # noqa: E402
+
+h5py = pytest.importorskip("h5py")
+zarr = pytest.importorskip("zarr")
+
+
+def _write_h5(path, arr, dataset="main"):
+    with h5py.File(path, "w") as f:
+        f.create_dataset(dataset, data=arr)
+    return str(path)
+
+
+def _banis_reference(a):
+    """Port of dev/zebrafinch/upload_affinity_full_masked.py (edge shift + channel flip)."""
+    out = np.empty_like(a)
+    for c in range(3):
+        s = a[c]
+        dst = np.empty_like(s)
+        hi = [slice(None)] * 3
+        lo = [slice(None)] * 3
+        hi[c] = slice(1, None)
+        lo[c] = slice(0, -1)
+        dst[tuple(hi)] = s[tuple(lo)]
+        face = [slice(None)] * 3
+        face[c] = 0
+        dst[tuple(face)] = 0
+        out[c] = dst
+    return np.transpose(np.clip(out[::-1], 0, 1), (3, 2, 1, 0))
+
+
+def _param(tmp_path, **kw):
+    p = tmp_path / "param"
+    p.write_text(json.dumps(kw))
+    os.environ["PARAM_JSON"] = str(p)
+    return p
+
+
+# --- dtype / C++ ABI -------------------------------------------------------------
+
+def test_float16_affinity_is_materialized_as_float32():
+    """aff.raw is mmapped as aff_t (float32); a float16 passthrough halves the file."""
+    a16 = np.random.default_rng(0).random((4, 4, 4, 3)).astype("float16")
+    out = convert_and_scale_integer_data(a16, "float32")
+    assert out.dtype == np.float32
+    assert out.nbytes == a16.size * 4
+
+
+def test_float32_affinity_is_not_copied_or_rescaled():
+    a32 = np.random.default_rng(1).random((4, 4, 4, 3)).astype("float32")
+    out = convert_and_scale_integer_data(a32, "float32")
+    assert out.dtype == np.float32
+    assert np.array_equal(out, a32)
+
+
+def test_h5_float16_read_then_convert_matches_source(tmp_path):
+    """End of the float16 chain: HDF5 -> backend -> cut_data's conversion -> aff_t."""
+    src = np.random.default_rng(2).random((3, 5, 6, 7)).astype("float16")
+    v = open_volume(_write_h5(tmp_path / "aff.h5", src))
+    block = np.asarray(v[0:7, 0:6, 0:5])
+    assert block.dtype == np.float16                      # adapter preserves storage dtype
+    conv = convert_and_scale_integer_data(block, "float32")
+    assert conv.dtype == np.float32
+    assert np.allclose(conv, np.transpose(src, (3, 2, 1, 0)).astype("float32"))
+
+
+# --- read correctness ------------------------------------------------------------
+
+def test_h5_read_matches_czyx_to_xyzc(tmp_path):
+    src = np.random.default_rng(3).random((3, 5, 6, 7)).astype("float32")
+    v = open_volume(_write_h5(tmp_path / "a.h5", src))
+    assert v.shape == (7, 6, 5, 3)
+    assert np.array_equal(np.asarray(v[0:7, 0:6, 0:5]), np.transpose(src, (3, 2, 1, 0)))
+    assert np.array_equal(np.asarray(v[1:4, 2:5, 1:3]),
+                          np.transpose(src, (3, 2, 1, 0))[1:4, 2:5, 1:3])
+
+
+def test_h5_dataset_selection(tmp_path):
+    p = tmp_path / "two.h5"
+    with h5py.File(p, "w") as f:
+        f.create_dataset("a", data=np.zeros((3, 2, 2, 2), "float32"))
+        f.create_dataset("b", data=np.ones((3, 2, 2, 2), "float32"))
+    with pytest.raises(ValueError, match="specify one"):
+        open_volume(str(p))
+    assert np.asarray(open_volume(f"{p}::b")[0:2, 0:2, 0:2]).max() == 1.0
+
+
+def test_h5_is_read_only(tmp_path):
+    src = np.zeros((3, 2, 2, 2), "float32")
+    v = open_volume(_write_h5(tmp_path / "ro.h5", src))
+    with pytest.raises(NotImplementedError, match="read-only"):
+        v[0:1, 0:1, 0:1] = np.ones((1, 1, 1, 3), "float32")
+
+
+# --- BANIS conversion ------------------------------------------------------------
+
+def test_banis_full_and_chunked_reads_match_reference(tmp_path):
+    src = np.random.default_rng(4).random((3, 9, 8, 7)).astype("float32")
+    path = _write_h5(tmp_path / "aff.h5", src)
+    _param(tmp_path, AFF_PATH=path, AFF_CONVENTION="banis")
+    v = open_volume(path)
+    ref = _banis_reference(src)
+    assert np.allclose(np.asarray(v[0:7, 0:8, 0:9]), ref)
+    # Sub-reads must equal the same whole-volume answer: the adapter reads one extra
+    # voxel on each low face so a chunk seam pulls the true neighbour, not a zero.
+    for x0 in (0, 3, 5):
+        for y0 in (0, 4):
+            for z0 in (0, 5):
+                got = np.asarray(v[x0:x0 + 2, y0:y0 + 3, z0:z0 + 4])
+                assert np.allclose(got, ref[x0:x0 + 2, y0:y0 + 3, z0:z0 + 4]), (x0, y0, z0)
+
+
+def test_banis_only_applies_to_aff_path(tmp_path):
+    src = np.random.default_rng(5).random((3, 4, 4, 4)).astype("float32")
+    aff = _write_h5(tmp_path / "aff.h5", src)
+    other = _write_h5(tmp_path / "seg.h5", src)
+    _param(tmp_path, AFF_PATH=aff, AFF_CONVENTION="banis")
+    assert np.array_equal(np.asarray(open_volume(other)[0:4, 0:4, 0:4]),
+                          np.transpose(src, (3, 2, 1, 0)))
+
+
+def test_banis_rejects_non_three_channel(tmp_path):
+    """4-channel affinity+myelin would be reordered into nonsense; refuse instead."""
+    src = np.random.default_rng(6).random((4, 4, 4, 4)).astype("float32")
+    path = _write_h5(tmp_path / "aff4.h5", src)
+    _param(tmp_path, AFF_PATH=path, AFF_CONVENTION="banis")
+    with pytest.raises(ValueError, match="exactly 3 channels"):
+        open_volume(path)
+
+
+def test_restore_sigmoid(tmp_path):
+    src = np.random.default_rng(7).random((3, 4, 4, 4)).astype("float32")
+    path = _write_h5(tmp_path / "aff.h5", src)
+    _param(tmp_path, AFF_PATH=path, AFF_CONVENTION="banis", AFF_RESTORE_SIGMOID=0.2)
+    p = np.clip(src, 1e-6, 1 - 1e-6)
+    logit = np.log(p) - np.log1p(-p)
+    ref = _banis_reference((1.0 / (1.0 + np.exp(-logit / 0.2))).astype("float32"))
+    assert np.allclose(np.asarray(open_volume(path)[0:4, 0:4, 0:4]), ref, atol=1e-6)
+
+
+# --- dispatch / guards -----------------------------------------------------------
+
+def test_nonzero_mip_is_rejected(tmp_path):
+    """Single-scale backends must not silently read scale 0 for a mip>0 request."""
+    path = _write_h5(tmp_path / "a.h5", np.zeros((3, 2, 2, 2), "float32"))
+    os.environ.pop("PARAM_JSON", None)
+    with pytest.raises(ValueError, match="single-scale"):
+        open_volume(path, mip=2)
+    open_volume(path, mip=0)          # mip 0 is fine
+    open_volume(path, mip=[9, 9, 20])  # a resolution triple means scale 0 here
+
+
+def test_path_detection_is_suffix_based(tmp_path):
+    assert is_h5_path("/x/a.h5") and is_h5_path("/x/a.h5::main") and is_h5_path("/x/a.hdf5")
+    assert is_zarr_path("/x/a.zarr") and is_zarr_path("/x/a.zarr/")
+    # a precomputed layer that merely lives under a *.zarr directory is NOT zarr
+    assert not is_zarr_path("/x/a.zarr/inner/precomputed_layer")
+    assert not is_zarr_path("/x/plain") and not is_h5_path("/x/plain")
+
+
+def test_zarr_roundtrip_and_default_read_only(tmp_path):
+    src = np.random.default_rng(8).random((3, 4, 5, 6)).astype("float32")
+    p = tmp_path / "a.zarr"
+    z = zarr.open(str(p), mode="w", shape=src.shape, chunks=src.shape, dtype="float32")
+    z[:] = src
+    os.environ.pop("PARAM_JSON", None)
+    v = open_volume(str(p))
+    assert np.array_equal(np.asarray(v[0:6, 0:5, 0:4]), np.transpose(src, (3, 2, 1, 0)))
+    # default is read-only, so a typo cannot silently create a store
+    missing = tmp_path / "nope.zarr"
+    with pytest.raises(Exception):
+        open_volume(str(missing))
+    assert not missing.exists()
+    w = open_volume(str(p), writable=True)
+    w[0:2, 0:2, 0:2] = np.full((2, 2, 2, 3), 0.25, "float32")
+    assert np.allclose(np.asarray(w[0:2, 0:2, 0:2]), 0.25)

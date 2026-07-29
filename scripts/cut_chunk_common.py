@@ -40,8 +40,14 @@ def convert_and_scale_integer_data(data, dtype_out):
         print(f"convert {data.dtype} to {dtype_out}")
         info = numpy.iinfo(data.dtype)
         return (data.astype(dtype_out, order='F') - info.min)/(info.max - info.min)
-    else:
-        return data
+    if data.dtype != numpy.dtype(dtype_out):
+        # Float input still has to MATCH the C++ ABI: save_raw_data() writes
+        # data.dtype verbatim and the binaries mmap aff.raw as aff_t (float, or
+        # double under -DDOUBLE). A float16 affinity -- what pytc inference writes --
+        # would otherwise produce a half-length file that is silently misread.
+        print(f"convert {data.dtype} to {dtype_out}")
+        return data.astype(dtype_out, order='F', copy=False)
+    return data
 
 def cut_data(data, start_coord, end_coord, padding):
     bb = tuple(slice(start_coord[i], end_coord[i]) for i in range(3))

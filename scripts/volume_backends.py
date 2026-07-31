@@ -47,9 +47,21 @@ _H5_SUFFIXES = (".h5", ".hdf5")
 
 
 def _strip_scheme(path):
-    for scheme in ("zarr://", "h5://", "hdf5://", "file://"):
+    """Local filesystem path for a possibly-URI path.
+
+    `file://` URIs are PERCENT-ENCODED (Path.as_uri() turns `test_step=0010` into
+    `test_step%3D0010`), so the scheme has to be unquoted, not just chopped. Skipping
+    that made every path containing `=` fail its backend predicate and silently fall
+    through to CloudVolume, which then failed on a missing `info`.
+    """
+    for scheme in ("zarr://", "h5://", "hdf5://"):
         if path.startswith(scheme):
             return path[len(scheme) :]
+    if path.startswith("file://"):
+        from urllib.parse import unquote
+        from urllib.request import url2pathname
+
+        return url2pathname(unquote(path[len("file://") :]))
     return path
 
 
@@ -128,6 +140,49 @@ class _ArrayVolume(object):
                 % (label, tuple(array.shape))
             )
 
+    def attach_keep_mask(self, mask_array):
+        """Zero affinity outside ``mask_array`` (non-zero == keep), 1:1 in (Z, Y, X).
+
+        The affinity a segmentation pipeline consumes is often masked to tissue
+        before use; reading the RAW inference output instead lets segments grow
+        through blood vessel / myelin / out-of-bounds and chain neurons together.
+        Masking is applied AFTER the convention shift, so a kept voxel still draws
+        its edge from the correct source even when that source is masked.
+        """
+        expected = tuple(int(v) for v in self._a.shape[-3:])
+        got = tuple(int(v) for v in mask_array.shape[-3:])
+        if len(mask_array.shape) != 3:
+            raise ValueError(
+                "%s: keep-mask must be (Z, Y, X), got %r" % (self._label, tuple(mask_array.shape))
+            )
+        # The mask may be smaller than a chunk-grid-padded volume; it must not be
+        # larger, and every masked read is clipped to its extent (outside == keep,
+        # matching how the reference mask was built).
+        if any(g > e for g, e in zip(got, expected)):
+            raise ValueError(
+                "%s: keep-mask %r is larger than the volume %r" % (self._label, got, expected)
+            )
+        self._mask = mask_array
+        return self
+
+    def _apply_keep_mask(self, out, zs, ys, xs):
+        """out is (X, Y, Z, C); slices are in volume (Z, Y, X) coordinates."""
+        if getattr(self, "_mask", None) is None:
+            return out
+        mz, my, mx = (int(v) for v in self._mask.shape[-3:])
+        keep = np.ones(
+            (zs.stop - zs.start, ys.stop - ys.start, xs.stop - xs.start), dtype=bool
+        )
+        z1, y1, x1 = min(zs.stop, mz), min(ys.stop, my), min(xs.stop, mx)
+        if z1 > zs.start and y1 > ys.start and x1 > xs.start:
+            sub = np.asarray(
+                self._mask[zs.start:z1, ys.start:y1, xs.start:x1]
+            ) != 0
+            keep[: z1 - zs.start, : y1 - ys.start, : x1 - xs.start] = sub
+        out = out.copy()
+        out[np.transpose(~keep, (2, 1, 0))] = 0  # (Z,Y,X) -> (X,Y,Z)
+        return out
+
     @property
     def shape(self):
         z, y, x = self._a.shape[-3:]
@@ -150,18 +205,40 @@ class _ArrayVolume(object):
         cs = key[3] if len(key) > 3 else slice(None)
         return xs, ys, zs, cs
 
+    def _norm(self, sl, dim):
+        if isinstance(sl, slice):
+            start, stop, _ = sl.indices(dim)
+            return slice(start, stop)
+        return slice(sl, sl + 1)
+
     def __getitem__(self, key):
         xs, ys, zs, cs = self._xyz_slices(key)
         if self._a.ndim == 4:
             if self._convention == "banis":
-                return self._read_banis(xs, ys, zs, cs)
-            block = self._a[cs, zs, ys, xs]  # (C, Z, Y, X)
-            block = np.asarray(block)
-            if block.ndim == 3:  # a single channel was selected by an int
-                block = block[np.newaxis, ...]
-            return np.transpose(block, (3, 2, 1, 0))  # -> (X, Y, Z, C)
+                out = self._read_banis(xs, ys, zs, cs)
+            else:
+                out = self._read_plain(xs, ys, zs, cs)
+            if getattr(self, "_mask", None) is None:
+                return out
+            zdim, ydim, xdim = (int(v) for v in self._a.shape[-3:])
+            return self._apply_keep_mask(
+                out, self._norm(zs, zdim), self._norm(ys, ydim), self._norm(xs, xdim)
+            )
         block = np.asarray(self._a[zs, ys, xs])  # (Z, Y, X)
         return np.transpose(block, (2, 1, 0))[..., np.newaxis]
+
+    def _read_plain(self, xs, ys, zs, cs):
+        block = self._a[cs, zs, ys, xs]  # (C, Z, Y, X)
+        block = np.asarray(block)
+        if block.ndim == 3:  # a single channel was selected by an int
+            block = block[np.newaxis, ...]
+        if self._restore_scale is not None:
+            # Undoing scale_sigmoid is a property of how the affinity was WRITTEN, not
+            # of the edge convention. Applying it only on the banis path meant a config
+            # with AFF_RESTORE_SIGMOID and no AFF_CONVENTION silently read compressed
+            # values -- affinity spanning ~0.08 instead of a bimodal 0..1.
+            block = _restore_sigmoid(block.astype(np.float32), self._restore_scale)
+        return np.transpose(block, (3, 2, 1, 0))  # -> (X, Y, Z, C)
 
     def _read_banis(self, xs, ys, zs, cs):
         """Read with a 1-voxel low-side margin, apply the BANIS->ABISS conversion."""
@@ -492,6 +569,45 @@ def _affinity_conversion_for(path):
     return convention, (float(scale) if scale is not None else None)
 
 
+def _keep_mask_for(path):
+    """Keep-mask volume for ``path``, from AFF_KEEP_MASK in the ABISS param file.
+
+    Scoped to AFF_PATH exactly like the convention keys: watershed/segmentation
+    volumes read through the same backend must not be masked.
+    """
+    param_json = os.environ.get("PARAM_JSON")
+    if not param_json or not os.path.exists(param_json):
+        return None
+    try:
+        with open(param_json) as handle:
+            param = json.load(handle)
+    except Exception:
+        return None
+    aff_path = param.get("AFF_PATH")
+    if not aff_path or str(aff_path) != str(path):
+        return None
+    mask_path = param.get("AFF_KEEP_MASK")
+    if not mask_path:
+        return None
+    raw = _strip_scheme(str(mask_path))
+    if raw.endswith(".zarr") or os.path.isdir(raw):
+        import zarr
+
+        return zarr.open(raw, mode="r")
+    import h5py
+
+    handle = h5py.File(raw, "r", locking=False)
+    names = [k for k in handle if isinstance(handle[k], h5py.Dataset)]
+    if len(names) != 1:
+        raise ValueError("%s: expected exactly one dataset in the keep-mask" % raw)
+    return handle[names[0]]
+
+
+def _with_keep_mask(volume, path):
+    mask = _keep_mask_for(path)
+    return volume if mask is None else volume.attach_keep_mask(mask)
+
+
 def open_volume(path, **kwargs):
     """Open ``path`` with the backend its name implies.
 
@@ -505,7 +621,11 @@ def open_volume(path, **kwargs):
     # Pop before the CloudVolume fallback: `writable` is ours, and forwarding it to
     # the CloudVolume constructor is a TypeError.
     writable = bool(kwargs.pop("writable", False))
-    if convention is None:
+    # Only consult the param file when the CALLER supplied neither. Keying this on
+    # `convention is None` alone silently discarded an explicit restore_sigmoid_scale
+    # whenever convention was omitted, so the caller got raw stored values while
+    # believing they were restored.
+    if convention is None and restore is None:
         convention, restore = _affinity_conversion_for(text)
     if is_h5_path(text) or is_zarr_path(text) or is_h5_chunkstore_path(text):
         # These backends expose a single scale. Silently ignoring a mip would read
@@ -533,17 +653,23 @@ def open_volume(path, **kwargs):
                     % (text, name, value)
                 )
     if is_h5_chunkstore_path(text):
-        return H5ChunkStoreVolume(
-            text, convention=convention, restore_sigmoid_scale=restore
+        return _with_keep_mask(
+            H5ChunkStoreVolume(text, convention=convention, restore_sigmoid_scale=restore),
+            text,
         )
     if is_h5_path(text):
-        return H5Volume(text, convention=convention, restore_sigmoid_scale=restore)
+        return _with_keep_mask(
+            H5Volume(text, convention=convention, restore_sigmoid_scale=restore), text
+        )
     if is_zarr_path(text):
-        return ZarrVolume(
+        return _with_keep_mask(
+            ZarrVolume(
+                text,
+                writable=writable,
+                convention=convention,
+                restore_sigmoid_scale=restore,
+            ),
             text,
-            writable=writable,
-            convention=convention,
-            restore_sigmoid_scale=restore,
         )
     from cloudvolume import CloudVolume
 

@@ -460,3 +460,38 @@ def test_keep_mask_larger_than_the_volume_is_rejected(tmp_path):
         f.create_dataset("main", data=data)
     with pytest.raises(ValueError, match="larger than the volume"):
         open_volume(str(path)).attach_keep_mask(np.ones((9, 9, 9), dtype="uint8"))
+
+
+def test_percent_encoded_file_uri_resolves(tmp_path):
+    """`file://` URIs are percent-encoded; the scheme must be UNQUOTED, not just chopped.
+
+    Path.as_uri() turns a directory named `test_step=00100000` into `test_step%3D00100000`.
+    Chopping `file://` without unquoting left the `%3D` in place, so os.path.isdir failed,
+    the chunk-store predicate returned False, and the caller silently fell through to
+    CloudVolume -- which then failed with a confusing "No info file was found". Every
+    affinity store whose path contains `=` was unreadable.
+    """
+    from pathlib import Path
+
+    d, full = _make_chunkstore(tmp_path)
+    encoded_parent = tmp_path / "test_step=00100000"
+    encoded_parent.mkdir()
+    moved = encoded_parent / "store.h5.chunks"
+    d.rename(moved)
+
+    uri = Path(moved).as_uri()
+    assert "%3D" in uri, "test premise: as_uri() should percent-encode the '='"
+
+    assert is_h5_chunkstore_path(uri), "percent-encoded URI must resolve to the chunk store"
+    vol = open_volume(uri)
+    reference = np.transpose(full, (3, 2, 1, 0))
+    assert np.allclose(np.asarray(vol[0:6, 0:6, 0:6]), reference[0:6, 0:6, 0:6])
+
+
+def test_plain_and_scheme_paths_still_resolve(tmp_path):
+    """The unquoting must not break bare paths or the non-file schemes."""
+    from pathlib import Path
+
+    d, _ = _make_chunkstore(tmp_path)
+    assert is_h5_chunkstore_path(str(d))               # bare path
+    assert is_h5_chunkstore_path(Path(d).as_uri())     # file:// URI, nothing to unquote

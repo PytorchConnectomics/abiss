@@ -47,9 +47,21 @@ _H5_SUFFIXES = (".h5", ".hdf5")
 
 
 def _strip_scheme(path):
-    for scheme in ("zarr://", "h5://", "hdf5://", "file://"):
+    """Local filesystem path for a possibly-URI path.
+
+    `file://` URIs are PERCENT-ENCODED (Path.as_uri() turns `test_step=0010` into
+    `test_step%3D0010`), so the scheme has to be unquoted, not just chopped. Skipping
+    that made every path containing `=` fail its backend predicate and silently fall
+    through to CloudVolume, which then failed on a missing `info`.
+    """
+    for scheme in ("zarr://", "h5://", "hdf5://"):
         if path.startswith(scheme):
             return path[len(scheme) :]
+    if path.startswith("file://"):
+        from urllib.parse import unquote
+        from urllib.request import url2pathname
+
+        return url2pathname(unquote(path[len("file://") :]))
     return path
 
 

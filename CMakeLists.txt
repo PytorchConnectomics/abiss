@@ -8,8 +8,23 @@ set(optionalLibs)
 
 set(CMAKE_CXX_STANDARD 20)
 
-set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS} -O3 -fopenmp")
-set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS} -Og -g -fopenmp")
+set(ABISS_ARCH "" CACHE STRING
+    "Architecture passed to -march (empty preserves inherited compiler flags)")
+if(ABISS_ARCH)
+    if(NOT ABISS_ARCH MATCHES "^[A-Za-z0-9_.+-]+$")
+        message(FATAL_ERROR "ABISS_ARCH must be a single architecture name")
+    endif()
+    string(REGEX REPLACE "(^|[ \t])-march=[^ \t]+" " " CMAKE_CXX_FLAGS
+        "${CMAKE_CXX_FLAGS}")
+    string(REGEX REPLACE "(^|[ \t])-mtune=[^ \t]+" " " CMAKE_CXX_FLAGS
+        "${CMAKE_CXX_FLAGS}")
+    string(STRIP "${CMAKE_CXX_FLAGS}" CMAKE_CXX_FLAGS)
+    string(APPEND CMAKE_CXX_FLAGS " -march=${ABISS_ARCH}")
+    add_compile_options("$<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>")
+endif()
+
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -fopenmp")
+set(CMAKE_CXX_FLAGS_DEBUG "-Og -g -fopenmp")
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 
@@ -24,18 +39,26 @@ if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     message(STATUS "Debug mode: forcing std::unordered_map")
 endif()
 
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(JEMALLOC jemalloc)
-pkg_check_modules(MIMALLOC mimalloc)
+set(ABISS_ALLOCATOR "system" CACHE STRING
+    "Allocator implementation: system, mimalloc, or jemalloc")
+set_property(CACHE ABISS_ALLOCATOR PROPERTY STRINGS system mimalloc jemalloc)
+if(NOT ABISS_ALLOCATOR MATCHES "^(system|mimalloc|jemalloc)$")
+    message(FATAL_ERROR
+        "ABISS_ALLOCATOR must be one of: system, mimalloc, jemalloc")
+endif()
 
-
-if(MIMALLOC_FOUND)
+if(ABISS_ALLOCATOR STREQUAL "system")
+    message(STATUS "Use the system allocator.")
+elseif(ABISS_ALLOCATOR STREQUAL "mimalloc")
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(MIMALLOC REQUIRED IMPORTED_TARGET mimalloc)
     add_definitions(-DUSE_MIMALLOC)
-    include_directories(${MIMALLOC_INCLUDE_DIRS})
-    set(optionalLibs ${optionalLibs} ${MIMALLOC_LDFLAGS})
+    list(APPEND optionalLibs PkgConfig::MIMALLOC)
     message(STATUS "Use mimalloc as the default allocator.")
-elseif(JEMALLOC_FOUND)
-    set(optionalLibs ${optionalLibs} ${JEMALLOC_LDFLAGS})
+elseif(ABISS_ALLOCATOR STREQUAL "jemalloc")
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(JEMALLOC REQUIRED IMPORTED_TARGET jemalloc)
+    list(APPEND optionalLibs PkgConfig::JEMALLOC)
     message(STATUS "Use jemalloc as the default allocator.")
 endif()
 

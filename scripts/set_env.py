@@ -29,6 +29,19 @@ def default_io_cmd(path):
 
 env = ["SCRATCH_PATH", "CHUNKMAP_INPUT", "CHUNKMAP_OUTPUT", "AFF_PATH", "AFF_MIP", "SEM_PATH", "SEM_MIP", "WS_PATH", "SEG_PATH", "WS_HIGH_THRESHOLD", "WS_LOW_THRESHOLD", "WS_SIZE_THRESHOLD", "WS_DUST_THRESHOLD", "AGG_THRESHOLD", "GT_PATH", "CLEFT_PATH", "MYELIN_THRESHOLD", "ADJUSTED_AFF_PATH", "CHUNKED_AGG_OUTPUT", "CHUNKED_SEG_PATH", "REDIS_SERVER", "REDIS_DB", "STATSD_HOST", "STATSD_PORT", "STATSD_PREFIX", "PARANOID", "BOTO_CONFIG", "UPLOAD_CMD", "DOWNLOAD_CMD", "IO_SCRATCH_PATH", "REMAP_SIZE_MAP_THRESHOLD"]
 
+# Agglomeration heuristics. Until now these were compile-time literals in
+# src/agg/mean_aggl.cpp, so tuning one meant editing the source and rebuilding; only
+# AGG_THRESHOLD (-> input_aff_threshold, argv[1]) was reachable from the param JSON.
+# Each is OPTIONAL: the export loop below skips keys absent from the JSON, and the binary
+# falls back to its original literal, so an existing param JSON produces an identical run.
+env += [
+    "AGG_SIZE_AFF_THRESHOLD", "AGG_SMALL_VOXEL_THRESHOLD", "AGG_LARGE_VOXEL_THRESHOLD",
+    "AGG_SEM_AFF_THRESHOLD", "AGG_SEM_TOTAL_SIGNAL_THRESHOLD", "AGG_SEM_DOMINANT_SIGNAL_RATIO",
+    "AGG_TWIG_AFF_THRESHOLD_DELTA", "AGG_TWIG_VOXEL_THRESHOLD", "AGG_TWIG_AREA_THRESHOLD",
+    "AGG_HEURISTICS_AFF_THRESHOLD", "AGG_STARTING_AFF_THRESHOLD", "AGG_STEP",
+    "AGG_MIN_EDGES", "AGG_NUM_PARTITIONS",
+]
+
 with open(sys.argv[1]) as f:
     data = json.load(f)
 

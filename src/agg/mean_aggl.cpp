@@ -152,6 +152,94 @@ struct agglomeration_param_t
     size_t minimal_number_of_edges = 100'000;
 };
 
+// ---------------------------------------------------------------------------
+// Environment overrides for the agglomeration heuristics.
+//
+// Only `input_aff_threshold` (argv[1] <- AGG_THRESHOLD) used to be reachable from the
+// param JSON; every other knob above was a compile-time literal, so tuning one meant
+// editing this file and rebuilding. These helpers let each be set from the environment,
+// which `scripts/set_env.py` populates from the param JSON, which the YAML feeds.
+//
+// Every default is the literal it replaces, so a run with none of these set is
+// bit-identical to the previous binary. `print_params` echoes the resolved values on
+// every run, so a segmentation's parameters are recoverable from its log.
+// ---------------------------------------------------------------------------
+
+static bool env_aff(const char * name, aff_t & out)
+{
+    const char * v = std::getenv(name);
+    if (v == nullptr || *v == '\0') return false;
+    out = static_cast<aff_t>(atof(v));
+    return true;
+}
+
+static bool env_double(const char * name, double & out)
+{
+    const char * v = std::getenv(name);
+    if (v == nullptr || *v == '\0') return false;
+    out = atof(v);
+    return true;
+}
+
+static bool env_size(const char * name, size_t & out)
+{
+    const char * v = std::getenv(name);
+    if (v == nullptr || *v == '\0') return false;
+    out = static_cast<size_t>(strtoull(v, nullptr, 10));
+    return true;
+}
+
+static void apply_env_overrides(agglomeration_param_t & p)
+{
+    env_aff   ("AGG_SIZE_AFF_THRESHOLD",        p.size_params.aff_threshold);
+    env_size  ("AGG_SMALL_VOXEL_THRESHOLD",     p.size_params.small_voxel_threshold);
+    env_size  ("AGG_LARGE_VOXEL_THRESHOLD",     p.size_params.large_voxel_threshold);
+
+    env_aff   ("AGG_SEM_AFF_THRESHOLD",         p.sem_params.aff_threshold);
+    env_size  ("AGG_SEM_TOTAL_SIGNAL_THRESHOLD",p.sem_params.total_signal_threshold);
+    env_double("AGG_SEM_DOMINANT_SIGNAL_RATIO", p.sem_params.dominant_signal_ratio);
+
+    env_aff   ("AGG_TWIG_AFF_THRESHOLD_DELTA",  p.twig_params.aff_threshold_delta);
+    env_size  ("AGG_TWIG_VOXEL_THRESHOLD",      p.twig_params.voxel_threshold);
+    env_size  ("AGG_TWIG_AREA_THRESHOLD",       p.twig_params.area_threshold);
+
+    // Derived from size/sem at construction, so it must be recomputed after those may
+    // have changed -- otherwise overriding size_params silently leaves it stale.
+    // An explicit AGG_HEURISTICS_AFF_THRESHOLD still wins.
+    p.heuristics_aff_threshold = p.size_params.aff_threshold > p.sem_params.aff_threshold
+                               ? p.size_params.aff_threshold : p.sem_params.aff_threshold;
+    env_aff   ("AGG_HEURISTICS_AFF_THRESHOLD",  p.heuristics_aff_threshold);
+
+    env_aff   ("AGG_STARTING_AFF_THRESHOLD",    p.starting_aff_threshold);
+    env_aff   ("AGG_STEP",                      p.agglomeration_step);
+    env_size  ("AGG_MIN_EDGES",                 p.minimal_number_of_edges);
+
+    // Defaults to omp_get_num_procs(), i.e. the segmentation depends on how many cores
+    // the machine had. Setting this pins it and makes runs portable across nodes.
+    env_size  ("AGG_NUM_PARTITIONS",            p.optimal_number_of_partitions);
+}
+
+static void print_params(const agglomeration_param_t & p)
+{
+    std::cout << "agglomeration parameters:"
+              << "\n  input_aff_threshold          " << p.input_aff_threshold
+              << "\n  size.aff_threshold           " << p.size_params.aff_threshold
+              << "\n  size.small_voxel_threshold   " << p.size_params.small_voxel_threshold
+              << "\n  size.large_voxel_threshold   " << p.size_params.large_voxel_threshold
+              << "\n  sem.aff_threshold            " << p.sem_params.aff_threshold
+              << "\n  sem.total_signal_threshold   " << p.sem_params.total_signal_threshold
+              << "\n  sem.dominant_signal_ratio    " << p.sem_params.dominant_signal_ratio
+              << "\n  twig.aff_threshold_delta     " << p.twig_params.aff_threshold_delta
+              << "\n  twig.voxel_threshold         " << p.twig_params.voxel_threshold
+              << "\n  twig.area_threshold          " << p.twig_params.area_threshold
+              << "\n  heuristics_aff_threshold     " << p.heuristics_aff_threshold
+              << "\n  starting_aff_threshold       " << p.starting_aff_threshold
+              << "\n  agglomeration_step           " << p.agglomeration_step
+              << "\n  optimal_number_of_partitions " << p.optimal_number_of_partitions
+              << "\n  minimal_number_of_edges      " << p.minimal_number_of_edges
+              << std::endl;
+}
+
 template <class T, class Compare = std::greater<T> >
 struct agglomeration_data_t
 {
@@ -1147,6 +1235,8 @@ int main(int argc, char *argv[])
     agglomeration_param_t params;
     aff_t th = atof(argv[1]);
     params.input_aff_threshold = th;
+    apply_env_overrides(params);
+    print_params(params);
 
     std::cout << "agglomerate" << std::endl;
 #ifdef MST_EDGE

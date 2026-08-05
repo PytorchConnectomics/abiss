@@ -192,6 +192,57 @@ void reduce_sem(const std::string & tag, const MapContainer<T, T> & remaps)
 }
 
 template <typename T>
+void reduce_nuc(const std::string & tag, const MapContainer<T, T> & remaps,
+                const SetContainer<T> & boundary_sv)
+{
+    const std::string input =
+        str(boost::format("ongoing_nuclei_labels_%1%.data") % tag);
+    std::vector<nuc_wire_t> nuc_array;
+    if (filesize(input) != 0) {
+        nuc_array = read_array<nuc_wire_t>(input);
+    }
+
+    MapContainer<T, nuc_record_t> reduced;
+    std::vector<nuc_wire_t> boundary_nuc;
+    uint64_t conflict_collisions = 0;
+    for (const auto & wire : nuc_array) {
+        if (boundary_sv.contains(wire.sid)) {
+            boundary_nuc.push_back(wire);
+            continue;
+        }
+        const T sid = remaps.contains(wire.sid) ? remaps.at(wire.sid) : wire.sid;
+        const auto record = nuc_record_from_wire(wire);
+        if (reduced.contains(sid)) {
+            const bool was_conflict =
+                reduced.at(sid).state == NUC_STATE_CONFLICT;
+            reduced[sid] = nuc_join(reduced.at(sid), record);
+            if (!was_conflict
+                && reduced.at(sid).state == NUC_STATE_CONFLICT) {
+                conflict_collisions = nuc_add(conflict_collisions, 1);
+            }
+        } else {
+            reduced[sid] = record;
+        }
+    }
+
+    std::vector<nuc_wire_t> output;
+    output.reserve(reduced.size());
+    for (const auto & [sid, record] : reduced) {
+        output.push_back(make_nuc_wire(sid, record));
+    }
+    std::sort(output.begin(), output.end(),
+              [](const auto & a, const auto & b) { return a.sid < b.sid; });
+    write_vector(str(boost::format("reduced_ongoing_nuclei_labels_%1%.data") % tag),
+                 output);
+    write_vector(str(boost::format("reduced_boundary_nuclei_labels_%1%.data") % tag),
+                 boundary_nuc);
+    if (!nuc_array.empty()) {
+        std::cout << "nuc: reduce_conflict_collisions "
+                  << conflict_collisions << std::endl;
+    }
+}
+
+template <typename T>
 void reduce_size(const std::string & tag, const MapContainer<T, T> & remaps)
 {
     auto size_array = read_array<size_data_t<T> >(str(boost::format("ongoing_seg_size_%1%.data") % tag));
@@ -226,6 +277,7 @@ int main(int argc, char ** argv)
     reduce_counts(tag, remaps, boundary_sv, reduced_map);
     reduce_edges<seg_t, aff_t>(tag, remaps);
     reduce_sem<seg_t, sem_array_t>(tag, remaps);
+    reduce_nuc(tag, remaps, boundary_sv);
     reduce_size(tag, remaps);
     write_vector("extra_remaps.data", std::vector<remap_data_t<seg_t> >(reduced_map.cbegin(), reduced_map.cend()));
 }

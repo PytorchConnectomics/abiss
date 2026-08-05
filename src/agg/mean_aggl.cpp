@@ -248,6 +248,7 @@ struct agglomeration_data_t
     std::vector<size_t> supervoxel_counts;
     std::vector<seg_t> seg_indices;
     std::vector<sem_array_t> sem_counts;
+    std::vector<nuc_record_t> nuc_ids;
     std::vector<size_t> seg_size;
     agglomeration_param_t params;
 };
@@ -258,6 +259,7 @@ struct agglomeration_output_t
     std::vector<edge_t<T> > res_rg_vector;
     std::vector<edge_t<T> > rej_rg_vector;
     std::vector<edge_t<T> > sem_rg_vector;
+    std::vector<edge_t<T> > nuc_rg_vector;
     std::vector<edge_t<T> > merged_rg_vector;
     std::vector<edge_t<T> > twig_rg_vector;
     std::vector<std::pair<seg_t, seg_t> > remap;
@@ -360,6 +362,42 @@ std::vector<sem_array_t> load_sem(const char * sem_filename, const std::vector<s
         std::transform(sem_counts[k].begin(), sem_counts[k].end(), v.begin(), sem_counts[k].begin(), std::plus<>());
     }
     return sem_counts;
+}
+
+std::vector<nuc_record_t> load_nuc(const char * nuc_filename, const std::vector<seg_t> & seg_indices)
+{
+    if (filesize(nuc_filename) == 0) {
+        return {};
+    }
+
+    auto nuc_array = read_array<nuc_wire_t>(nuc_filename);
+    std::vector<nuc_record_t> nuc_ids(seg_indices.size());
+    std::vector<bool> populated(seg_indices.size(), false);
+    uint64_t conflict_collisions = 0;
+
+    for (const auto & wire : nuc_array) {
+        const auto it = std::lower_bound(seg_indices.begin(), seg_indices.end(), wire.sid);
+        if (it == seg_indices.end() || wire.sid != *it) {
+            std::cerr << "nuc: cannot find nucleus sid " << wire.sid << std::endl;
+            std::abort();
+        }
+        const size_t index = std::distance(seg_indices.begin(), it);
+        const auto record = nuc_record_from_wire(wire);
+        if (populated[index]) {
+            const bool was_conflict =
+                nuc_ids[index].state == NUC_STATE_CONFLICT;
+            nuc_ids[index] = nuc_join(nuc_ids[index], record);
+            if (!was_conflict
+                && nuc_ids[index].state == NUC_STATE_CONFLICT) {
+                conflict_collisions = nuc_add(conflict_collisions, 1);
+            }
+        } else {
+            nuc_ids[index] = record;
+            populated[index] = true;
+        }
+    }
+    std::cout << "nuc: load_conflict_collisions " << conflict_collisions << std::endl;
+    return nuc_ids;
 }
 
 template <class T, class Compare = std::greater<T>, class Plus = std::plus<T>, class Limits = std::numeric_limits<T> >
@@ -631,6 +669,7 @@ inline agglomeration_data_t<T, Compare> preprocess_inputs(const char * rg_filena
     }
 
     agg_data.sem_counts = load_sem("ongoing_semantic_labels.data", seg_indices);
+    agg_data.nuc_ids = load_nuc("ongoing_nuclei_labels.data", seg_indices);
     agg_data.seg_size = load_size("ongoing_seg_size.data", seg_indices);
     agg_data.incident.resize(seg_indices.size());
 
@@ -746,6 +785,7 @@ inline agglomeration_output_t<T> agglomerate_cc(agglomeration_data_t<T, Compare>
     auto & supervoxel_counts = agg_data.supervoxel_counts;
     auto & seg_indices = agg_data.seg_indices;
     auto & sem_counts = agg_data.sem_counts;
+    auto & nuc_ids = agg_data.nuc_ids;
     auto & seg_size = agg_data.seg_size;
     auto & rg_vector = agg_data.rg_vector;
     agglomeration_output_t<T> output;
@@ -780,6 +820,12 @@ inline agglomeration_output_t<T> agglomerate_cc(agglomeration_data_t<T, Compare>
                 supervoxel_counts[v0] |= frozen;
                 supervoxel_counts[v1] |= frozen;
                 output.res_rg_vector.push_back(*(e.edge));
+                e.edge->w = Limits::min();
+                continue;
+            }
+
+            if (!nuc_ids.empty() && !nuc_can_merge(nuc_ids[v0], nuc_ids[v1])) {
+                output.nuc_rg_vector.push_back(*(e.edge));
                 e.edge->w = Limits::min();
                 continue;
             }
@@ -843,6 +889,25 @@ inline agglomeration_output_t<T> agglomerate_cc(agglomeration_data_t<T, Compare>
                 std::transform(sem_counts[v0].begin(), sem_counts[v0].end(), sem_counts[v1].begin(), sem_counts[v0].begin(), std::plus<size_t>());
                 sem_counts[v1] = sem_array_t();
                 std::swap(sem_counts[v0], sem_counts[s]);
+            }
+
+            if (!nuc_ids.empty()) {
+                const auto nucleus0 = nuc_ids[v0];
+                const auto nucleus1 = nuc_ids[v1];
+                if (!nuc_can_merge(nucleus0, nucleus1)) {
+                    std::cerr << "nuc: merge propagation violated veto for "
+                              << seg_indices[v0] << " (state="
+                              << static_cast<unsigned>(nucleus0.state) << ", id="
+                              << nucleus0.id << ", count=" << nucleus0.count << ", total="
+                              << nucleus0.total << ") and " << seg_indices[v1] << " (state="
+                              << static_cast<unsigned>(nucleus1.state) << ", id="
+                              << nucleus1.id << ", count=" << nucleus1.count << ", total="
+                              << nucleus1.total << ")" << std::endl;
+                    std::abort();
+                }
+                nuc_ids[v0] = nuc_join(nucleus0, nucleus1);
+                nuc_ids[v1] = nuc_record_t();
+                std::swap(nuc_ids[v0], nuc_ids[s]);
             }
 
             output.merged_rg_vector.push_back(*(e.edge));
@@ -929,12 +994,15 @@ void write_supervoxel_info(const agglomeration_data_t<T, Compare> & agg_data)
     auto & supervoxel_counts = agg_data.supervoxel_counts;
     auto & seg_indices = agg_data.seg_indices;
     auto & sem_counts = agg_data.sem_counts;
+    auto & nuc_ids = agg_data.nuc_ids;
     auto & seg_size = agg_data.seg_size;
 
     std::ofstream of_fs_ongoing;
     std::ofstream of_fs_done;
     std::ofstream of_sem_ongoing;
     std::ofstream of_sem_done;
+    std::ofstream of_nuc_ongoing;
+    std::ofstream of_nuc_done;
     std::ofstream of_size_ongoing;
     std::ofstream of_size_done;
 
@@ -943,6 +1011,9 @@ void write_supervoxel_info(const agglomeration_data_t<T, Compare> & agg_data)
 
     of_sem_ongoing.open("ongoing_sem.data", std::ofstream::out | std::ofstream::trunc);
     of_sem_done.open("done_sem.data", std::ofstream::out | std::ofstream::trunc);
+
+    of_nuc_ongoing.open("ongoing_nuc.data", std::ofstream::out | std::ofstream::trunc);
+    of_nuc_done.open("done_nuc.data", std::ofstream::out | std::ofstream::trunc);
 
     of_size_ongoing.open("ongoing_size.data", std::ofstream::out | std::ofstream::trunc);
     of_size_done.open("done_size.data", std::ofstream::out | std::ofstream::trunc);
@@ -969,6 +1040,10 @@ void write_supervoxel_info(const agglomeration_data_t<T, Compare> & agg_data)
                 of_sem_ongoing.write(reinterpret_cast<const char *>(&(seg_indices[i])), sizeof(seg_t));
                 of_sem_ongoing.write(reinterpret_cast<const char *>(&(sem_counts[i])), sizeof(sem_array_t));
             }
+            if (!nuc_ids.empty()) {
+                const auto wire = make_nuc_wire(seg_indices[i], nuc_ids[i]);
+                of_nuc_ongoing.write(reinterpret_cast<const char *>(&wire), sizeof(wire));
+            }
             of_size_ongoing.write(reinterpret_cast<const char *>(&(seg_indices[i])), sizeof(seg_t));
             of_size_ongoing.write(reinterpret_cast<const char *>(&(seg_size[i])), sizeof(size_t));
         } else {
@@ -977,6 +1052,10 @@ void write_supervoxel_info(const agglomeration_data_t<T, Compare> & agg_data)
             if (!sem_counts.empty()) {
                 of_sem_done.write(reinterpret_cast<const char *>(&(seg_indices[i])), sizeof(seg_t));
                 of_sem_done.write(reinterpret_cast<const char *>(&(sem_counts[i])), sizeof(sem_array_t));
+            }
+            if (!nuc_ids.empty()) {
+                const auto wire = make_nuc_wire(seg_indices[i], nuc_ids[i]);
+                of_nuc_done.write(reinterpret_cast<const char *>(&wire), sizeof(wire));
             }
             of_size_done.write(reinterpret_cast<const char *>(&(seg_indices[i])), sizeof(seg_t));
             of_size_done.write(reinterpret_cast<const char *>(&(seg_size[i])), sizeof(size_t));
@@ -989,6 +1068,9 @@ void write_supervoxel_info(const agglomeration_data_t<T, Compare> & agg_data)
     assert(!of_sem_ongoing.bad());
     assert(!of_sem_done.bad());
 
+    assert(!of_nuc_ongoing.bad());
+    assert(!of_nuc_done.bad());
+
     assert(!of_size_ongoing.bad());
     assert(!of_size_done.bad());
 
@@ -997,6 +1079,9 @@ void write_supervoxel_info(const agglomeration_data_t<T, Compare> & agg_data)
 
     of_sem_ongoing.close();
     of_sem_done.close();
+
+    of_nuc_ongoing.close();
+    of_nuc_done.close();
 
     of_size_ongoing.close();
     of_size_done.close();
@@ -1047,6 +1132,9 @@ inline void agglomerate(const char * rg_filename, const char * fs_filename, cons
 
     std::ofstream of_sem_cuts;
     of_sem_cuts.open("sem_cuts.data", std::ofstream::out | std::ofstream::trunc);
+
+    std::ofstream of_nuc_cuts;
+    of_nuc_cuts.open("nuc_cuts.data", std::ofstream::out | std::ofstream::trunc);
 
     std::ofstream of_twig;
     of_twig.open("twig_edges.log", std::ofstream::out | std::ofstream::trunc);
@@ -1140,6 +1228,10 @@ inline void agglomerate(const char * rg_filename, const char * fs_filename, cons
                 of_sem_cuts.write(reinterpret_cast<const char *>(&(seg_indices[e.v1])), sizeof(seg_t));
                 //write_edge(of_reject, e.w);
             }
+            for (auto & e: o.nuc_rg_vector) {
+                of_nuc_cuts.write(reinterpret_cast<const char *>(&(seg_indices[e.v0])), sizeof(seg_t));
+                of_nuc_cuts.write(reinterpret_cast<const char *>(&(seg_indices[e.v1])), sizeof(seg_t));
+            }
             for (auto & e: o.twig_rg_vector) {
                 of_twig.write(reinterpret_cast<const char *>(&(seg_indices[e.v0])), sizeof(seg_t));
                 of_twig.write(reinterpret_cast<const char *>(&(seg_indices[e.v1])), sizeof(seg_t));
@@ -1208,11 +1300,13 @@ inline void agglomerate(const char * rg_filename, const char * fs_filename, cons
     assert(!of_frg.bad());
     assert(!of_reject.bad());
     assert(!of_sem_cuts.bad());
+    assert(!of_nuc_cuts.bad());
     assert(!of_twig.bad());
     of_res.close();
     of_frg.close();
     of_reject.close();
     of_sem_cuts.close();
+    of_nuc_cuts.close();
     of_twig.close();
 
     std::ofstream of_meta;

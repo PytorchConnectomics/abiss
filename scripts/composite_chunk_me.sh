@@ -38,10 +38,13 @@ if [ "$OVERLAP" = "2"  ]; then
     try mv residual_rg.data o_residual_rg.data
     try mv ongoing_supervoxel_counts.data o_ongoing_supervoxel_counts.data
     try mv ongoing_semantic_labels.data o_ongoing_semantic_labels.data
+    try mv ongoing_nuclei_labels.data o_ongoing_nuclei_labels.data
+    try mv boundary_nuclei_labels.data o_boundary_nuclei_labels.data
     try mv ongoing_seg_size.data o_ongoing_seg_size.data
     try $BIN_PATH/match_chunks $output_chunk
     try cat extra_remaps.data >> localmap.data
     try cat extra_sv_counts.data >> ongoing_supervoxel_counts.data
+    try cat extra_nuc.data >> ongoing_nuclei_labels.data
 fi
 
 
@@ -86,8 +89,10 @@ fi
 
 try mv done_segments.data ${output_path}/info/info_"$output_chunk".data
 try mv done_sem.data ${output_path}/info/semantic_labels_"$output_chunk".data
+try mv done_nuc.data ${output_path}/info/nuclei_labels_"$output_chunk".data
 try mv done_size.data ${output_path}/info/seg_size_"$output_chunk".data
 try mv sem_cuts.data ${output_path}/info/sem_rejected_edges_"$output_chunk".log
+try mv nuc_cuts.data ${output_path}/info/nuc_rejected_edges_"$output_chunk".log
 try mv rejected_edges.log ${output_path}/info/size_rejected_edges_"$output_chunk".log
 try mv twig_edges.log ${output_path}/info/twig_edges_"$output_chunk".log
 try mv remap ${output_path}
@@ -95,6 +100,7 @@ try mv remap ${output_path}
 try mv residual_rg.data residual_rg_"$output_chunk".data
 try mv ongoing_segments.data ongoing_supervoxel_counts_"$output_chunk".data
 try mv ongoing_sem.data ongoing_semantic_labels_"$output_chunk".data
+try mv ongoing_nuc.data ongoing_nuclei_labels_"$output_chunk".data
 try mv ongoing_size.data ongoing_seg_size_"$output_chunk".data
 
 if [ -n "$META" ]; then

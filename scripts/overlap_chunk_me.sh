@@ -48,6 +48,7 @@ try rm residual_rg*.data
 try touch residual_rg_"$output_chunk".data
 
 try cp sem_cuts.data vetoed_edges_"$output_chunk".data
+try cat nuc_cuts.data >> vetoed_edges_"$output_chunk".data
 try cat extra_remaps.data >> ongoing_"$output_chunk".data
 
 for i in {0..5}
@@ -58,12 +59,16 @@ done
 try mv reduced_edges_"$output_chunk".data incomplete_edges_"$output_chunk".data
 try mv reduced_ongoing_supervoxel_counts_"$output_chunk".data ongoing_supervoxel_counts_"$output_chunk".data
 try mv reduced_ongoing_semantic_labels_"$output_chunk".data ongoing_semantic_labels_"$output_chunk".data
+try mv reduced_ongoing_nuclei_labels_"$output_chunk".data ongoing_nuclei_labels_"$output_chunk".data
+try mv reduced_boundary_nuclei_labels_"$output_chunk".data boundary_nuclei_labels_"$output_chunk".data
 try mv reduced_ongoing_seg_size_"$output_chunk".data ongoing_seg_size_"$output_chunk".data
 
 try mv done_segments.data ${output_path}/info/info_"$output_chunk"_extra.data
 try mv done_sem.data ${output_path}/info/semantic_labels_"$output_chunk"_extra.data
+try mv done_nuc.data ${output_path}/info/nuclei_labels_"$output_chunk"_extra.data
 try mv done_size.data ${output_path}/info/seg_size_"$output_chunk"_extra.data
 try mv sem_cuts.data ${output_path}/info/sem_rejected_edges_"$output_chunk"_extra.log
+try mv nuc_cuts.data ${output_path}/info/nuc_rejected_edges_"$output_chunk"_extra.log
 
 if [ "$PARANOID" = "1" ]; then
     try md5sum *_"${output_chunk}".data > ${output_path}/scratch2/"${output_chunk}".data.md5sum

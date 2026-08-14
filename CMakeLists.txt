@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.8)
 project(ABISS)
+include(CTest)
 set(Boost_USE_STATIC_LIBS OFF)
 set(Boost_USE_MULTITHREADED ON)
 set(Boost_USE_STATIC_RUNTIME OFF)
@@ -128,6 +129,18 @@ add_executable(accs
     src/seg/contact_surface.cpp)
 add_executable(mecs
     src/seg/merge_cs.cpp)
+
+if(BUILD_TESTING)
+    add_executable(test_nuc_algebra tests/test_nuc_algebra.cpp)
+    add_test(NAME nuc_algebra COMMAND test_nuc_algebra)
+    add_executable(test_nuc_extractor tests/test_nuc_extractor.cpp)
+    add_test(NAME nuc_extractor COMMAND test_nuc_extractor)
+    find_package(Python3 COMPONENTS Interpreter REQUIRED)
+    add_test(
+        NAME nuc_agg_veto
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_nuc_agg.py
+                $<TARGET_FILE:agg>)
+endif()
 #target_compile_definitions(agg PRIVATE FINAL PRIVATE EXTRA)
 #target_compile_definitions(agg_overlap PRIVATE OVERLAPPED PRIVATE FINAL PRIVATE EXTRA)
 #target_compile_definitions(agg_extra PRIVATE EXTRA)

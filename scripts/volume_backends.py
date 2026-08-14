@@ -28,6 +28,7 @@ Concurrency: ABISS runs many chunk workers at once.
     Attempting to write raises instead of quietly producing garbage.
 """
 import collections
+import itertools
 import json
 import re
 import os
@@ -109,7 +110,11 @@ class _ArrayVolume(object):
     """
 
     def __init__(self, array, writable=False, label="", convention=None,
-                 restore_sigmoid_scale=None):
+                 restore_sigmoid_scale=None, channels=None):
+        # Applied FIRST, so the channel check below and every downstream transform
+        # (convention shift, sigmoid restore, keep-mask) see the selected channels only.
+        if channels is not None and getattr(array, "ndim", 0) == 4:
+            array = _ChannelSubsetArray(array, channels)
         self._a = array
         self._writable = writable
         self._label = label
@@ -303,7 +308,7 @@ class _ArrayVolume(object):
 class H5Volume(_ArrayVolume):
     """Read-only HDF5 volume. Path may be ``file.h5`` or ``file.h5::dataset``."""
 
-    def __init__(self, path, convention=None, restore_sigmoid_scale=None):
+    def __init__(self, path, convention=None, restore_sigmoid_scale=None, channels=None):
         import h5py
 
         raw = _strip_scheme(str(path))
@@ -334,14 +339,15 @@ class H5Volume(_ArrayVolume):
         super(H5Volume, self).__init__(
             self._handle[dataset], writable=False,
             label="HDF5 %s::%s" % (raw, dataset),
-            convention=convention, restore_sigmoid_scale=restore_sigmoid_scale,
+            convention=convention, restore_sigmoid_scale=restore_sigmoid_scale, channels=channels,
         )
 
 
 class ZarrVolume(_ArrayVolume):
     """Zarr volume. Concurrent writes are safe only for disjoint chunk-aligned regions."""
 
-    def __init__(self, path, writable=False, convention=None, restore_sigmoid_scale=None):
+    def __init__(self, path, writable=False, convention=None, restore_sigmoid_scale=None,
+                 channels=None):
         import zarr
 
         raw = _strip_scheme(str(path))
@@ -349,7 +355,7 @@ class ZarrVolume(_ArrayVolume):
         self._array = zarr.open(raw, mode="a" if writable else "r")
         super(ZarrVolume, self).__init__(
             self._array, writable=writable, label="zarr %s" % raw,
-            convention=convention, restore_sigmoid_scale=restore_sigmoid_scale,
+            convention=convention, restore_sigmoid_scale=restore_sigmoid_scale, channels=channels,
         )
 
     def __setitem__(self, key, value):
@@ -407,6 +413,41 @@ class _ChunkedH5Array(object):
     _NAME_RE = re.compile(r"^chunk_z(\d+)_y(\d+)_x(\d+)\.h5$")
     _MAX_OPEN = 8
 
+    @staticmethod
+    def _configured_bbox_zyx(directory):
+        """Return the required affinity grid from the production parameter file.
+
+        A large Slurm array can create thousands of simultaneous NFS ``readdir``
+        calls.  On the zebrafinch run, a few workers received an incomplete
+        directory listing; the old adapter interpreted omitted files as absent
+        tiles and silently filled those regions with zero affinity.  Atomic
+        chunks spanning such a seam then disagreed with their neighbours.
+
+        ``BBOX`` is the authoritative set of cells required by ABISS.  Construct
+        their deterministic filenames directly instead of rediscovering them in
+        every worker.  Reads of a genuinely missing file then fail in h5py rather
+        than manufacturing valid-looking zeros.
+        """
+        param_json = os.environ.get("PARAM_JSON")
+        if not param_json or not os.path.exists(param_json):
+            return None
+        try:
+            with open(param_json) as handle:
+                param = json.load(handle)
+        except Exception:
+            return None
+        aff_path = param.get("AFF_PATH")
+        bbox = param.get("BBOX")
+        if not aff_path or not isinstance(bbox, (list, tuple)) or len(bbox) != 6:
+            return None
+        configured = _strip_scheme(str(aff_path)).split("::", 1)[0].rstrip("/")
+        if os.path.abspath(configured) != os.path.abspath(directory.rstrip("/")):
+            return None
+        # Parameter BBOX is XYZXYZ; storage and filenames are ZYX.
+        return tuple(
+            (int(bbox[axis]), int(bbox[axis + 3])) for axis in (2, 1, 0)
+        )
+
     def __init__(self, directory, dataset=None):
         import h5py
 
@@ -415,15 +456,26 @@ class _ChunkedH5Array(object):
         self._h5py = h5py
         self._open = collections.OrderedDict()
 
+        required_bbox = self._configured_bbox_zyx(directory)
         self._index = {}
-        for name in os.listdir(directory):
-            m = self._NAME_RE.match(name)
-            if m:
-                self._index[tuple(int(v) for v in m.groups())] = os.path.join(directory, name)
-        if not self._index:
-            raise ValueError("%s: no chunk_z*_y*_x*.h5 files found" % directory)
+        if required_bbox is not None:
+            # Production whole-volume stores start at grid zero.  Opening a
+            # deterministic probe avoids the unreliable per-worker readdir.
+            probe_key = (0, 0, 0)
+            self._index[probe_key] = os.path.join(
+                directory, "chunk_z0_y0_x0.h5"
+            )
+        else:
+            for name in os.listdir(directory):
+                m = self._NAME_RE.match(name)
+                if m:
+                    self._index[tuple(int(v) for v in m.groups())] = os.path.join(
+                        directory, name
+                    )
+            if not self._index:
+                raise ValueError("%s: no chunk_z*_y*_x*.h5 files found" % directory)
+            probe_key = min(self._index)
 
-        probe_key = min(self._index)
         with h5py.File(self._index[probe_key], "r") as f:
             if self._dataset is None:
                 names = [k for k in f if isinstance(f[k], h5py.Dataset)]
@@ -452,6 +504,20 @@ class _ChunkedH5Array(object):
                         "shape %r; the filename grid is not the storage layout."
                         % (directory, got, probe_key, self._cshape)
                     )
+
+        if required_bbox is not None:
+            ranges = []
+            for axis, (lo, hi) in enumerate(required_bbox):
+                first = lo // self._cshape[axis]
+                last = max(first, (hi - 1) // self._cshape[axis])
+                ranges.append(range(first, last + 1))
+            self._index = {
+                key: os.path.join(
+                    directory,
+                    "chunk_z%d_y%d_x%d.h5" % key,
+                )
+                for key in itertools.product(*ranges)
+            }
 
         grid = [max(k[i] for k in self._index) + 1 for i in range(3)]
         self._grid = tuple(grid)
@@ -519,7 +585,7 @@ class _ChunkedH5Array(object):
 class H5ChunkStoreVolume(_ArrayVolume):
     """Read-only view over a directory of grid-indexed affinity HDF5 chunks."""
 
-    def __init__(self, path, convention=None, restore_sigmoid_scale=None):
+    def __init__(self, path, convention=None, restore_sigmoid_scale=None, channels=None):
         raw = _strip_scheme(str(path))
         dataset = None
         if "::" in raw:
@@ -527,7 +593,7 @@ class H5ChunkStoreVolume(_ArrayVolume):
         array = _ChunkedH5Array(raw, dataset=dataset)
         super(H5ChunkStoreVolume, self).__init__(
             array, writable=False, label="h5-chunkstore %s" % raw,
-            convention=convention, restore_sigmoid_scale=restore_sigmoid_scale,
+            convention=convention, restore_sigmoid_scale=restore_sigmoid_scale, channels=channels,
         )
 
 
@@ -536,6 +602,11 @@ def is_h5_chunkstore_path(path):
     raw = _strip_scheme(str(path)).split("::", 1)[0]
     if not os.path.isdir(raw):
         return False
+    # Production stores are zero-based.  Prefer a deterministic lookup: using
+    # readdir here would reintroduce the same NFS omission that the adapter's
+    # configured grid avoids below.
+    if os.path.isfile(os.path.join(raw, "chunk_z0_y0_x0.h5")):
+        return True
     try:
         return any(_ChunkedH5Array._NAME_RE.match(n) for n in os.listdir(raw))
     except OSError:
@@ -567,6 +638,75 @@ def _affinity_conversion_for(path):
     convention = param.get("AFF_CONVENTION")
     scale = param.get("AFF_RESTORE_SIGMOID")
     return convention, (float(scale) if scale is not None else None)
+
+
+class _ChannelSubsetArray(object):
+    """Present channels ``keep`` of a (C, Z, Y, X) array as a dense (len(keep), Z, Y, X).
+
+    Multi-radius inference writes several affinities into one file -- arm2_ft_mix is
+    (6, 1008, 1008, 1008), r1 in channels 0-2 and a second radius in 3-5. ABISS wants one
+    3-channel affinity, and the BANIS convention REVERSES the channel axis, so handing it
+    all six would put the wrong radius into x/y/z: plausible-looking and wrong. Selecting
+    here, UNDERNEATH _ArrayVolume, means the convention shift, sigmoid restore and
+    keep-mask all see exactly the three channels they expect.
+    """
+
+    def __init__(self, array, keep):
+        self._a = array
+        n = int(array.shape[0])
+        self._keep = [int(c) for c in keep]
+        bad = [c for c in self._keep if not 0 <= c < n]
+        if bad:
+            raise ValueError(
+                "AFF_CHANNELS %r out of range for a %d-channel volume (bad: %r)"
+                % (self._keep, n, bad)
+            )
+        self.shape = (len(self._keep),) + tuple(int(v) for v in array.shape[1:])
+        self.ndim = 4
+        self.dtype = array.dtype
+
+    def __getitem__(self, key):
+        if not isinstance(key, tuple):
+            key = (key,)
+        key = key + (slice(None),) * (4 - len(key))
+        csel, rest = key[0], key[1:]
+        squeeze = not isinstance(csel, slice)
+        idx = [self._keep[csel]] if squeeze else self._keep[csel]
+        # One read per selected channel: the channel axis is tiny, so a loop is both
+        # correct and cheap. Ask with a length-1 SLICE rather than an int, because
+        # _ChunkedH5Array KEEPS the channel axis for an int index while h5py DROPS it --
+        # stacking those two shapes silently produced a 5-D block.
+        planes = []
+        for c in idx:
+            a = np.asarray(self._a[(slice(c, c + 1),) + tuple(rest)])
+            planes.append(a[0] if a.ndim == len(rest) + 1 else a)
+        out = np.stack(planes, axis=0)
+        return out[0] if squeeze else out
+
+
+def _channels_for(path):
+    """Channel subset for ``path`` from AFF_CHANNELS in the ABISS param file.
+
+    Scoped to AFF_PATH like the other affinity-format keys. ``"AFF_CHANNELS": [0, 1, 2]``
+    takes the first three channels of a multi-radius volume.
+    """
+    param_json = os.environ.get("PARAM_JSON")
+    if not param_json or not os.path.exists(param_json):
+        return None
+    try:
+        with open(param_json) as handle:
+            param = json.load(handle)
+    except Exception:
+        return None
+    aff_path = param.get("AFF_PATH")
+    if not aff_path or str(aff_path) != str(path):
+        return None
+    chans = param.get("AFF_CHANNELS")
+    if chans is None:
+        return None
+    if isinstance(chans, (int, str)):
+        chans = [int(chans)]
+    return [int(c) for c in chans]
 
 
 def _keep_mask_for(path):
@@ -627,6 +767,11 @@ def open_volume(path, **kwargs):
     # believing they were restored.
     if convention is None and restore is None:
         convention, restore = _affinity_conversion_for(text)
+    # Channel subset is independent of the convention keys: a multi-radius affinity
+    # needs it even when no conversion is requested.
+    channels = kwargs.pop("channels", None)
+    if channels is None:
+        channels = _channels_for(text)
     if is_h5_path(text) or is_zarr_path(text) or is_h5_chunkstore_path(text):
         # These backends expose a single scale. Silently ignoring a mip would read
         # full-resolution voxels while the chunk coordinates refer to another scale,
@@ -654,12 +799,14 @@ def open_volume(path, **kwargs):
                 )
     if is_h5_chunkstore_path(text):
         return _with_keep_mask(
-            H5ChunkStoreVolume(text, convention=convention, restore_sigmoid_scale=restore),
+            H5ChunkStoreVolume(text, convention=convention, restore_sigmoid_scale=restore,
+                               channels=channels),
             text,
         )
     if is_h5_path(text):
         return _with_keep_mask(
-            H5Volume(text, convention=convention, restore_sigmoid_scale=restore), text
+            H5Volume(text, convention=convention, restore_sigmoid_scale=restore,
+                     channels=channels), text
         )
     if is_zarr_path(text):
         return _with_keep_mask(
@@ -668,6 +815,7 @@ def open_volume(path, **kwargs):
                 writable=writable,
                 convention=convention,
                 restore_sigmoid_scale=restore,
+                channels=channels,
             ),
             text,
         )

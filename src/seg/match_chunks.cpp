@@ -291,7 +291,8 @@ std::vector<T> process_boundary_supervoxels(const std::string & tag, const remap
 }
 
 template <class T>
-void generate_extra_counts(const remap_data<T> & rep, const std::vector<T> & bs)
+std::vector<std::pair<T, T> > extra_supervoxels(
+    const remap_data<T> & rep, const std::vector<T> & bs)
 {
     auto remap_vector = read_array<matching_entry_t<T> >("matching_faces.data");
     std::stable_sort(std::execution::par, remap_vector.begin(), remap_vector.end(), [](auto & a, auto & b) {
@@ -326,11 +327,64 @@ void generate_extra_counts(const remap_data<T> & rep, const std::vector<T> & bs)
         return (a.first == b.first && a.second == b.second);
     });
     processed_sv.erase(last, processed_sv.end());
+    return processed_sv;
+}
+
+template <class T>
+void generate_extra_counts(const std::vector<std::pair<T, T> > & processed_sv)
+{
     std::ofstream ofs("extra_sv_counts.data", std::ios_base::binary);
     const size_t sv_size = 1;
     for (size_t i = 1; i < processed_sv.size(); i++) {
         ofs.write(reinterpret_cast<const char *>(&(processed_sv[i].second)), sizeof(T));
         ofs.write(reinterpret_cast<const char *>(&(sv_size)), sizeof(size_t));
+    }
+    assert(!ofs.bad());
+    ofs.close();
+}
+
+template <class T>
+void generate_extra_nucs(const std::vector<std::pair<T, T> > & processed_sv)
+{
+    std::vector<nuc_wire_t> boundary_nucs;
+    if (filesize("o_boundary_nuclei_labels.data") != 0) {
+        boundary_nucs = read_array<nuc_wire_t>("o_boundary_nuclei_labels.data");
+    }
+
+    MapContainer<T, nuc_record_t> by_source;
+    for (const auto & wire : boundary_nucs) {
+        const auto record = nuc_record_from_wire(wire);
+        if (by_source.contains(wire.sid)) {
+            by_source[wire.sid] = nuc_join(by_source.at(wire.sid), record);
+        } else {
+            by_source[wire.sid] = record;
+        }
+    }
+
+    MapContainer<T, nuc_record_t> by_target;
+    for (size_t i = 1; i < processed_sv.size(); i++) {
+        const auto & [oid, sid] = processed_sv[i];
+        if (!by_source.contains(oid)) {
+            continue;
+        }
+        if (by_target.contains(sid)) {
+            by_target[sid] = nuc_join(by_target.at(sid), by_source.at(oid));
+        } else {
+            by_target[sid] = by_source.at(oid);
+        }
+    }
+
+    std::vector<nuc_wire_t> output;
+    output.reserve(by_target.size());
+    for (const auto & [sid, record] : by_target) {
+        output.push_back(make_nuc_wire(sid, record));
+    }
+    std::sort(output.begin(), output.end(),
+              [](const auto & a, const auto & b) { return a.sid < b.sid; });
+
+    std::ofstream ofs("extra_nuc.data", std::ios_base::binary);
+    for (const auto & wire : output) {
+        ofs.write(reinterpret_cast<const char *>(&wire), sizeof(wire));
     }
     assert(!ofs.bad());
     ofs.close();
@@ -400,6 +454,60 @@ void process_sems(remap_data<T> rep)
 }
 
 template <class T>
+void process_nucs(const remap_data<T> & rep)
+{
+    std::vector<nuc_wire_t> nucs;
+    if (filesize("o_ongoing_nuclei_labels.data") != 0) {
+        nucs = read_array<nuc_wire_t>("o_ongoing_nuclei_labels.data");
+    }
+
+    MapContainer<T, nuc_record_t> reduced;
+    uint64_t conflict_collisions = 0;
+    for (const auto & wire : nucs) {
+        T sid = wire.sid;
+        const auto it = std::lower_bound(rep.segids.begin(), rep.segids.end(), sid);
+        if (it != rep.segids.end() && sid == *it) {
+            const auto index = std::distance(rep.segids.begin(), it);
+            if (rep.remaps[index].sid != 0) {
+                sid = rep.segids[rep.remaps[index].sid];
+            }
+        }
+
+        const auto record = nuc_record_from_wire(wire);
+        if (reduced.contains(sid)) {
+            const bool was_conflict =
+                reduced.at(sid).state == NUC_STATE_CONFLICT;
+            reduced[sid] = nuc_join(reduced.at(sid), record);
+            if (!was_conflict
+                && reduced.at(sid).state == NUC_STATE_CONFLICT) {
+                conflict_collisions = nuc_add(conflict_collisions, 1);
+            }
+        } else {
+            reduced[sid] = record;
+        }
+    }
+
+    std::vector<nuc_wire_t> output;
+    output.reserve(reduced.size());
+    for (const auto & [sid, record] : reduced) {
+        output.push_back(make_nuc_wire(sid, record));
+    }
+    std::sort(output.begin(), output.end(),
+              [](const auto & a, const auto & b) { return a.sid < b.sid; });
+
+    std::ofstream ofs("ongoing_nuclei_labels.data", std::ios_base::binary);
+    for (const auto & wire : output) {
+        ofs.write(reinterpret_cast<const char *>(&wire), sizeof(wire));
+    }
+    assert(!ofs.bad());
+    ofs.close();
+    if (!nucs.empty()) {
+        std::cout << "nuc: match_conflict_collisions "
+                  << conflict_collisions << std::endl;
+    }
+}
+
+template <class T>
 void write_extra_remaps(remap_data<T> & rep)
 {
     std::ofstream ofs("extra_remaps.data", std::ios_base::binary);
@@ -433,12 +541,17 @@ int main(int argc, char * argv[])
     std::cout << "remap edges" << std::endl;
     auto bs = process_boundary_supervoxels<seg_t>(tag, rep);
     std::cout << "reduce boundary supervoxels" << std::endl;
-    generate_extra_counts(rep, bs);
+    const auto extra_sv = extra_supervoxels(rep, bs);
+    generate_extra_counts(extra_sv);
     std::cout << "generate extra supervoxel counts" << std::endl;
+    generate_extra_nucs(extra_sv);
+    std::cout << "generate extra nucleus labels" << std::endl;
     process_counts(rep);
     std::cout << "reduce segment sizes" << std::endl;
     process_sems(rep);
     std::cout << "reduce semantic labels" << std::endl;
+    process_nucs(rep);
+    std::cout << "reduce nucleus labels" << std::endl;
     process_size(rep);
     std::cout << "reduce sizes" << std::endl;
     write_extra_remaps<seg_t>(rep);

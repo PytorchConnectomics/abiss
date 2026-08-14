@@ -34,6 +34,7 @@ done
 
 try touch ns.data
 try touch ongoing_semantic_labels.data
+try touch ongoing_nuclei_labels.data
 try touch ongoing_seg_size.data
 
 if [ "$OVERLAP" = "1" ]; then
@@ -48,8 +49,10 @@ try taskset -c $cpuid $BIN_PATH/assort $output_chunk $META
 
 try mv done_segments.data ${output_path}/info/info_"$output_chunk".data
 try mv done_sem.data ${output_path}/info/semantic_labels_"$output_chunk".data
+try mv done_nuc.data ${output_path}/info/nuclei_labels_"$output_chunk".data
 try mv done_size.data ${output_path}/info/seg_size_"$output_chunk".data
 try mv sem_cuts.data ${output_path}/info/sem_rejected_edges_"$output_chunk".log
+try mv nuc_cuts.data ${output_path}/info/nuc_rejected_edges_"$output_chunk".log
 try mv rejected_edges.log ${output_path}/info/size_rejected_edges_"$output_chunk".log
 try mv twig_edges.log ${output_path}/info/twig_edges_"$output_chunk".log
 try mv chunked_rg ${output_path}
@@ -58,6 +61,7 @@ try mv remap ${output_path}
 try mv residual_rg.data residual_rg_"$output_chunk".data
 try mv ongoing_segments.data ongoing_supervoxel_counts_"$output_chunk".data
 try mv ongoing_sem.data ongoing_semantic_labels_"$output_chunk".data
+try mv ongoing_nuc.data ongoing_nuclei_labels_"$output_chunk".data
 try mv ongoing_size.data ongoing_seg_size_"$output_chunk".data
 
 if [ "$PARANOID" = "1" ]; then

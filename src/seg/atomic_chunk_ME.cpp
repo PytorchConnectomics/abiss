@@ -7,6 +7,7 @@
 #include "SizeExtractor.hpp"
 #include "COMExtractor.hpp"
 #include "SemExtractor.hpp"
+#include "NucExtractor.hpp"
 #include "BBoxExtractor.hpp"
 #include "MeanEdge.hpp"
 #include "ReweightedLocalMeanEdge.hpp"
@@ -17,6 +18,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <optional>
 #include <boost/format.hpp>
 #include <boost/iostreams/device/mapped_file.hpp>
 
@@ -77,6 +79,35 @@ int main(int argc, char * argv[])
     BBoxExtractor<seg_t, int64_t> bbox_extractor;
 #endif
 
+    bio::mapped_file_source nuc_file;
+    std::optional<ConstChunkRef<nuc_t, 3>> nuc_chunk;
+    nuc_ratio_t nuc_ratio;
+    uint64_t nuc_min_tagged = 50;
+    if (std::filesystem::exists("nuc.raw")) {
+        const size_t nuc_bytes = sizeof(nuc_t)*dim[0]*dim[1]*dim[2];
+        const size_t actual_nuc_bytes = std::filesystem::file_size("nuc.raw");
+        if (actual_nuc_bytes != nuc_bytes) {
+            std::cerr << "nuc: nuc.raw size mismatch: expected " << nuc_bytes
+                      << " bytes, got " << actual_nuc_bytes << " bytes" << std::endl;
+            std::abort();
+        }
+        nuc_file.open("nuc.raw", nuc_bytes);
+        assert(nuc_file.is_open());
+        nuc_chunk.emplace(
+            reinterpret_cast<const nuc_t*>(nuc_file.data()),
+            boost::extents[Range(offset[0], offset[0]+dim[0])]
+                          [Range(offset[1], offset[1]+dim[1])]
+                          [Range(offset[2], offset[2]+dim[2])],
+            boost::fortran_storage_order());
+        nuc_ratio = nuc_ratio_from_env();
+        nuc_min_tagged = nuc_min_tagged_from_env();
+        std::cout << "mmap nuc data" << std::endl;
+    }
+    NucExtractor<seg_t, ConstChunkRef<nuc_t, 3>> nuc_extractor(
+        nuc_chunk ? &(*nuc_chunk) : nullptr,
+        nuc_ratio,
+        nuc_min_tagged);
+
     if (std::filesystem::exists("sem.raw")) {
         bio::mapped_file_source sem_file;
         size_t sem_bytes = sizeof(semantic_t)*dim[0]*dim[1]*dim[2];
@@ -85,7 +116,8 @@ int main(int argc, char * argv[])
         ConstChunkRef<semantic_t, 3> sem_chunk(reinterpret_cast<const semantic_t*>(sem_file.data()), boost::extents[Range(offset[0], offset[0]+dim[0])][Range(offset[1], offset[1]+dim[1])][Range(offset[2], offset[2]+dim[2])], boost::fortran_storage_order());
         std::cout << "mmap sem data" << std::endl;
         SemExtractor<seg_t, semantic_t, ConstChunkRef<semantic_t, 3> > sem_extractor(sem_chunk);
-        traverseSegments<1>(seg_chunk, boundary_extractor, affinity_extractor, sem_extractor, chunked_rg_extractor
+        traverseSegments<1>(seg_chunk, boundary_extractor, affinity_extractor, sem_extractor,
+                            nuc_extractor, chunked_rg_extractor
 #ifdef EXTRACT_COM
                      ,com_extractor
 #endif
@@ -98,7 +130,8 @@ int main(int argc, char * argv[])
                      );
         sem_extractor.output(map, "ongoing_semantic_labels.data");
     } else {
-        traverseSegments<1>(seg_chunk, boundary_extractor, affinity_extractor, chunked_rg_extractor
+        traverseSegments<1>(seg_chunk, boundary_extractor, affinity_extractor,
+                            nuc_extractor, chunked_rg_extractor
 #ifdef EXTRACT_COM
                      ,com_extractor
 #endif
@@ -108,8 +141,9 @@ int main(int argc, char * argv[])
 #ifdef EXTRACT_BBOX
                      ,bbox_extractor
 #endif
-                     );
+        );
     }
+    nuc_extractor.output(map, "ongoing_nuclei_labels.data");
 
     auto incomplete_segments = boundary_extractor.incompleteSupervoxels(map);
 

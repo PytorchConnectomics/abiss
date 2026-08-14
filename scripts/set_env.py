@@ -45,6 +45,16 @@ env += [
 with open(sys.argv[1]) as f:
     data = json.load(f)
 
+# Nucleus settings remain absent from the default path. When NUC_PATH is set,
+# export the explicit [z,y,x] transform, including its identity defaults.
+if "NUC_PATH" in data:
+    data.setdefault("NUC_RATIO", [1, 1, 1])
+    data.setdefault("NUC_OFFSET", [0, 0, 0])
+    env.extend([
+        "NUC_PATH", "NUC_MIP", "NUC_RATIO", "NUC_OFFSET",
+        "ABISS_NUC_DOMINANCE", "ABISS_NUC_MIN_TAGGED",
+    ])
+
 data["STATSD_PREFIX"] = sanitize_runname(data["NAME"])
 
 for s in ["SCRATCH", "WS", "SEG"]:

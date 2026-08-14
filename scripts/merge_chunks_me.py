@@ -57,6 +57,9 @@ def merge_chunks(p):
     cu.merge_intermediate_outputs(p, "ongoing")
     cu.merge_intermediate_outputs(p, "ongoing_supervoxel_counts")
     cu.merge_intermediate_outputs(p, "ongoing_semantic_labels")
+    cu.merge_intermediate_outputs(p, "ongoing_nuclei_labels")
+    if os.environ['OVERLAP'] == '2':
+        cu.merge_intermediate_outputs(p, "boundary_nuclei_labels")
     cu.merge_intermediate_outputs(p, "ongoing_seg_size")
     if os.environ['OVERLAP'] == '2':
         cu.merge_intermediate_outputs(p, "vetoed_edges")

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cassert>
 #include <execution>
+#include <numeric>
 #include <sys/stat.h>
 #include <boost/format.hpp>
 #include <boost/pending/disjoint_sets.hpp>
@@ -26,6 +27,35 @@ struct remap_data
     std::vector<matching_value<T> > remaps;
     std::vector<matching_value<T> > extra_remaps;
 };
+
+template <class T>
+std::vector<nuc_record_t> load_matching_nuclei(const std::vector<T> & segids)
+{
+    std::vector<nuc_record_t> records(segids.size());
+    uint64_t conflict_collisions = 0;
+    for (const char * filename : {
+             "o_ongoing_nuclei_labels.data",
+             "o_boundary_nuclei_labels.data"}) {
+        if (filesize(filename) == 0) {
+            continue;
+        }
+        for (const auto & wire : read_array<nuc_wire_t>(filename)) {
+            const auto it = std::lower_bound(segids.begin(), segids.end(), wire.sid);
+            if (it == segids.end() || wire.sid != *it) {
+                continue;
+            }
+            const size_t index = std::distance(segids.begin(), it);
+            const bool was_conflict = records[index].state == NUC_STATE_CONFLICT;
+            records[index] = nuc_join(records[index], nuc_record_from_wire(wire));
+            if (!was_conflict && records[index].state == NUC_STATE_CONFLICT) {
+                conflict_collisions = nuc_add(conflict_collisions, 1);
+            }
+        }
+    }
+    std::cout << "nuc: match_input_conflict_collisions "
+              << conflict_collisions << std::endl;
+    return records;
+}
 
 template <class T>
 remap_data<T> generate_remaps()
@@ -80,12 +110,37 @@ remap_data<T> generate_remaps()
     std::vector<T> rank(rep.segids.size());
     std::vector<T> parent(rep.segids.size());
     boost::disjoint_sets<T*, T*> sets(&rank[0], &parent[0]);
+    auto component_nuclei = load_matching_nuclei(rep.segids);
+    std::vector<matching_entry_t<T> > accepted_remaps;
+    accepted_remaps.reserve(remap_vector.size());
+    uint64_t rejected_remaps = 0;
+    std::ofstream nuc_cuts("nuc_match_cuts.tsv");
+    assert(nuc_cuts.is_open());
+    nuc_cuts << "oid\tnid\toid_component\tnid_component\t"
+             << "oid_state\toid_nucleus\tnid_state\tnid_nucleus\t"
+             << "boundary_size\tagg_size\n";
 
     for (size_t i = 0; i != rep.segids.size(); i++) {
         sets.make_set(i);
     }
 
     for (auto & e : remap_vector) {
+        const T oid_root = sets.find_set(e.oid);
+        const T nid_root = sets.find_set(e.nid);
+        if (oid_root != nid_root
+            && !nuc_can_merge(component_nuclei[oid_root],
+                              component_nuclei[nid_root])) {
+            nuc_cuts << rep.segids[e.oid] << '\t' << rep.segids[e.nid] << '\t'
+                     << rep.segids[oid_root] << '\t' << rep.segids[nid_root] << '\t'
+                     << static_cast<unsigned>(component_nuclei[oid_root].state) << '\t'
+                     << component_nuclei[oid_root].id << '\t'
+                     << static_cast<unsigned>(component_nuclei[nid_root].state) << '\t'
+                     << component_nuclei[nid_root].id << '\t'
+                     << e.boundary_size << '\t' << e.agg_size << '\n';
+            rejected_remaps = nuc_add(rejected_remaps, 1);
+            continue;
+        }
+
         if (remaps[e.oid].sid == 0) {
             remaps[e.oid] = matching_value(e.nid, e.agg_size);
         } else {
@@ -95,8 +150,17 @@ remap_data<T> generate_remaps()
         if (remaps[e.nid].sid == 0) {
             remaps[e.nid] = matching_value(e.nid, e.agg_size);
         }
-        sets.union_set(e.oid, e.nid);
+        accepted_remaps.push_back(e);
+        if (oid_root != nid_root) {
+            const auto joined = nuc_join(component_nuclei[oid_root],
+                                         component_nuclei[nid_root]);
+            sets.union_set(oid_root, nid_root);
+            component_nuclei[sets.find_set(oid_root)] = joined;
+        }
     }
+    assert(!nuc_cuts.bad());
+    nuc_cuts.close();
+    std::cout << "nuc: match_rejected_remaps " << rejected_remaps << std::endl;
 
     {
         std::vector<T> idx(rep.segids.size());
@@ -107,7 +171,7 @@ remap_data<T> generate_remaps()
     std::vector<T> normalized_parent(rep.segids.size());
 
     // Pick the largest segment to represent, it is required because the way we populated extra_remaps above
-    for (auto & e: remap_vector) {
+    for (auto & e: accepted_remaps) {
         auto nid = parent[e.nid];
         if (normalized_parent[nid] == 0) {
             normalized_parent[nid] = e.nid;

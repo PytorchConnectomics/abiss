@@ -140,6 +140,10 @@ if(BUILD_TESTING)
         NAME nuc_agg_veto
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_nuc_agg.py
                 $<TARGET_FILE:agg>)
+    add_test(
+        NAME nuc_match_veto
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_nuc_match.py
+                $<TARGET_FILE:match_chunks>)
 endif()
 #target_compile_definitions(agg PRIVATE FINAL PRIVATE EXTRA)
 #target_compile_definitions(agg_overlap PRIVATE OVERLAPPED PRIVATE FINAL PRIVATE EXTRA)

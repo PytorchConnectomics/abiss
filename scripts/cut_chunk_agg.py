@@ -4,7 +4,7 @@ from cut_chunk_common import load_data, cut_data, pad_data, save_raw_data
 from augment_affinity import adjust_affinitymap, warp_z
 import os
 import numpy
-from nucleus_overlay import apply_nucleus_competition
+from nucleus_overlay import apply_nucleus_competition_state
 
 def chunk_origin(bbox):
     offset = bbox[0:3]
@@ -112,17 +112,8 @@ end_coord = [bbox[i+3]+1-boundary_flags[i+3] for i in range(3)]
 
 seg = load_data(os.environ['WS_PATH'], mip=global_param['AFF_RESOLUTION'], fill_missing=global_param.get('WS_FILL_MISSING', False))
 seg_cutout = cut_data(seg, start_coord, end_coord, boundary_flags)
-seg_cutout = apply_nucleus_competition(
-    seg_cutout,
-    [start_coord[i] - boundary_flags[i] for i in range(3)],
-    global_param)
-save_raw_data("seg.raw", seg_cutout)
 
-if "SEM_PATH" in global_param:
-    sem = load_data(global_param['SEM_PATH'], mip=global_param['AFF_RESOLUTION'], fill_missing=global_param.get('SEM_FILL_MISSING', False))
-    sem_cutout = cut_data(sem, start_coord, end_coord, boundary_flags)
-    save_raw_data("sem.raw", sem_cutout)
-
+nuc_cutout = None
 if "NUC_PATH" in global_param:
     nuc_ratio = nucleus_axis_vector(
         global_param, "NUC_RATIO", [1, 1, 1], positive=True)
@@ -134,6 +125,20 @@ if "NUC_PATH" in global_param:
     nuc_cutout = cut_nucleus_data(
         nuc, start_coord, end_coord, boundary_flags, nuc_ratio, nuc_offset)
     nuc_cutout = validate_nucleus_cutout(nuc_cutout, seg_cutout.shape[:3])
+
+seg_cutout, nuc_cutout = apply_nucleus_competition_state(
+    seg_cutout,
+    nuc_cutout,
+    [start_coord[i] - boundary_flags[i] for i in range(3)],
+    global_param)
+save_raw_data("seg.raw", seg_cutout)
+
+if "SEM_PATH" in global_param:
+    sem = load_data(global_param['SEM_PATH'], mip=global_param['AFF_RESOLUTION'], fill_missing=global_param.get('SEM_FILL_MISSING', False))
+    sem_cutout = cut_data(sem, start_coord, end_coord, boundary_flags)
+    save_raw_data("sem.raw", sem_cutout)
+
+if nuc_cutout is not None:
     save_raw_data("nuc.raw", nuc_cutout)
 
 #save_data("aff.h5", aff_cutout)

@@ -870,6 +870,18 @@ inline agglomeration_output_t<T> agglomerate_cc(agglomeration_data_t<T, Compare>
                 s = v1;
             }
 #endif
+            // Preserve a nucleus-bearing representative when it absorbs an
+            // untagged component.  Watershed ids are global across atomic
+            // chunks, so choosing the shared untagged id independently in two
+            // children can alias two different nucleus owners before the
+            // parent agglomerator has an edge on which to apply the veto.
+            if (!nuc_ids.empty()) {
+                const bool tagged0 = nuc_ids[v0].state != NUC_STATE_NONE;
+                const bool tagged1 = nuc_ids[v1].state != NUC_STATE_NONE;
+                if (tagged0 != tagged1) {
+                    s = tagged0 ? v0 : v1;
+                }
+            }
             if (is_frozen(supervoxel_counts[v0])) {
                 s = v0;
             } else if (is_frozen(supervoxel_counts[v1])) {

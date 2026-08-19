@@ -93,6 +93,9 @@ try mv done_nuc.data ${output_path}/info/nuclei_labels_"$output_chunk".data
 try mv done_size.data ${output_path}/info/seg_size_"$output_chunk".data
 try mv sem_cuts.data ${output_path}/info/sem_rejected_edges_"$output_chunk".log
 try mv nuc_cuts.data ${output_path}/info/nuc_rejected_edges_"$output_chunk".log
+if [ "$OVERLAP" = "2" ]; then
+    try mv nuc_match_cuts.tsv ${output_path}/info/nuc_match_rejected_remaps_"$output_chunk".tsv
+fi
 try mv rejected_edges.log ${output_path}/info/size_rejected_edges_"$output_chunk".log
 try mv twig_edges.log ${output_path}/info/twig_edges_"$output_chunk".log
 try mv remap ${output_path}

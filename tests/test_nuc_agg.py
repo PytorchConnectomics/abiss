@@ -14,18 +14,20 @@ def wire(sid, state, nucleus_id=0, count=0, total=0):
     return struct.pack("<QBIQQ", sid, state, nucleus_id, count, total)
 
 
-def run_case(binary, records):
+def run_case(binary, records, sizes=(100, 100)):
     with tempfile.TemporaryDirectory(prefix="abiss-nuc-agg-") as name:
         path = Path(name)
         (path / "input_rg.data").write_bytes(
             struct.pack("<QQfQ", 100, 200, 407.4, 420)
         )
         (path / "frozen.data").write_bytes(b"")
-        (path / "ns.data").write_bytes(struct.pack("<QQQQ", 100, 100, 200, 100))
+        (path / "ns.data").write_bytes(
+            struct.pack("<QQQQ", 100, sizes[0], 200, sizes[1])
+        )
         (path / "ongoing_semantic_labels.data").write_bytes(b"")
         (path / "ongoing_nuclei_labels.data").write_bytes(b"".join(records))
         (path / "ongoing_seg_size.data").write_bytes(
-            struct.pack("<QQQQ", 100, 100, 200, 100)
+            struct.pack("<QQQQ", 100, sizes[0], 200, sizes[1])
         )
         result = subprocess.run(
             [str(binary), "0.25", "input_rg.data", "frozen.data", "ns.data"],
@@ -59,6 +61,16 @@ def main():
 
     cuts, remaps = run_case(binary, [proper_1])
     assert cuts == b"" and len(remaps) == 16
+
+    # A tagged component must remain the representative even when it is the
+    # smaller side.  Otherwise the same global untagged watershed id can
+    # absorb different nucleus owners in separate atomic chunks and collide
+    # before the parent RAG veto gets a chance to run.
+    cuts, remaps = run_case(binary, [proper_1], sizes=(1, 100))
+    assert cuts == b"" and struct.unpack("<QQ", remaps) == (200, 100)
+
+    cuts, remaps = run_case(binary, [wire(200, 1, 1, 100, 100)], sizes=(100, 1))
+    assert cuts == b"" and struct.unpack("<QQ", remaps) == (100, 200)
 
     cuts, remaps = run_case(binary, [conflict, proper_2])
     assert len(cuts) == 16 and remaps == b""

@@ -1,6 +1,7 @@
 import sys
 from chunk_utils import read_inputs
 from cut_chunk_common import load_data, cut_data, save_raw_data
+from nucleus_overlay import apply_nucleus_competition
 import os
 import numpy as np
 
@@ -14,6 +15,8 @@ end_coord = bbox[3:6]
 
 seg = load_data(os.environ['WS_PATH'], mip=global_param['AFF_RESOLUTION'], fill_missing=False)
 seg_cutout = cut_data(seg, start_coord, end_coord, boundary_flags)
+seg_cutout = apply_nucleus_competition(
+    seg_cutout, start_coord, global_param)
 save_raw_data("seg.raw", seg_cutout)
 
 
@@ -36,4 +39,3 @@ if "CLEFT_PATH" in global_param:
 
 #save_data("aff.h5", aff_cutout)
 #save_data("seg.h5", seg_cutout)
-

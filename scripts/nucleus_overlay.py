@@ -281,8 +281,12 @@ def load_validated_manifest(manifest_path, global_params):
                 "production overlay"
             )
         if schema_version == "1.2":
+            # Resolve the tool from this module's own directory rather than naming a
+            # repo-relative path: the overlay is deployed as part of abiss/scripts, so the
+            # migration tool is always its sibling, whatever the checkout is called.
+            migrate_tool = Path(__file__).resolve().parent / "migrate_nucleus_competition.py"
             command = (
-                "python dev/zebrafinch/migrate_nucleus_competition.py --manifest "
+                f"python {shlex.quote(str(migrate_tool))} --manifest "
                 f"{shlex.quote(str(manifest_path.resolve()))}"
             )
             raise ValueError(

@@ -15,9 +15,9 @@ if [ "$1" = 0 ]; then
 elif [ "$1" = 1 ]; then
     try cat "$1".txt | $PARALLEL_CMD $SCRIPT_PATH/run_wrapper.sh . "$2" {}
 elif [ "$1" = 2 ]; then
-    try cat "$1".txt | parallel -j 8 --verbose $SCRIPT_PATH/run_wrapper.sh . "$2" {}
+    try cat "$1".txt | $PARALLEL_CMD $SCRIPT_PATH/run_wrapper.sh . "$2" {}
 else
-    try cat "$1".txt | parallel -j 4 --verbose $SCRIPT_PATH/run_wrapper.sh . "$2" {}
+    try cat "$1".txt | $PARALLEL_CMD $SCRIPT_PATH/run_wrapper.sh . "$2" {}
 fi
 
 try python3 ${SCRIPT_PATH}/update_task_flag.py ${TASK_KEY} "DONE"

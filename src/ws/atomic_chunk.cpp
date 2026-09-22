@@ -28,12 +28,16 @@
 // target defines WS_INTERNAL_SEG64 to widen it.
 //
 // WHY THIS IS A SWITCH AND NOT JUST A WIDER TYPE. The watershed packs flag bits
-// into the id (watershed_traits<T>::high_bit / visited / dir_mask in types.hpp),
-// so one chunk cannot hold more voxels than `high_bit`. With uint32_t that is a
-// hard 2,147,483,648-voxel ceiling per invocation -- the IST LICONN 18 nm val
-// decode sits at 98.3% of it and the mip0 val volume is 7.8x over. uint64_t
-// lifts the ceiling to 2^63 at the cost of 4 extra bytes per voxel for `seg`
-// (and for `seg_copy` in multi-threshold mode).
+// into the id (watershed_traits<T>::high_bit / dir_mask in types.hpp): an
+// unfinished voxel holds direction flags, a finished one `high_bit | segment
+// id`. That bounds the number of SEGMENTS below `high_bit` -- 2^31 for uint32 --
+// and nothing else. Voxels are indexed with ptrdiff_t throughout, so the voxel
+// count is NOT bounded by this type (it once was, by a conservative assert
+// below; see the comment there). uint64_t only matters if a chunk could produce
+// 2^31 basins, and it costs 4 extra bytes per voxel for `seg` (and for
+// `seg_copy` in multi-threshold mode). It stays available as `ws64`, which also
+// serves as the reference that a uint32 decode past 2^31 voxels is checked
+// against.
 //
 // The ON-DISK FORMAT IS UNAFFECTED either way: relabel_segments() deduces its
 // output type from the uint64 `offset` argument, so the written volume is
@@ -150,7 +154,12 @@ int main(int argc, char* argv[])
 
     size_t chunk_size = xdim * ydim * zdim;
 
-    assert(chunk_size < static_cast<size_t>(watershed_traits<internal_seg_t>::high_bit));
+    // No voxel-count limit here. This used to assert
+    // chunk_size < watershed_traits<internal_seg_t>::high_bit, i.e. 2^31 voxels
+    // for uint32 -- but the watershed indexes voxels with ptrdiff_t, and
+    // internal_seg_t only has to hold SEGMENT ids (plus its flag bit). The real
+    // bound, basins < high_bit, is enforced in watershed() at runtime. A uint32
+    // chunk therefore runs past 2^31 voxels with uint32's memory footprint.
 
     clock_t begin = clock();
     std::array<size_t, 4> aff_dim({xdim,ydim,zdim,3});

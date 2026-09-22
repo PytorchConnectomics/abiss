@@ -2,6 +2,7 @@
 
 #include "types.hpp"
 
+#include <cstdlib>
 #include <iostream>
 
 #define CW_FOR_2( type, v1, f1, t1, v2, f2, t2 )                \
@@ -156,6 +157,20 @@ watershed( const affinity_graph_ptr<F>& aff_ptr, const L& lowv, const H& highv ,
 
                 if ( bfs_start != bfs_end )
                 {
+                    // The ONLY capacity limit of an ID type here: a finished
+                    // voxel holds `high_bit | segment id`, so ids must stay
+                    // below high_bit. Voxel positions are `index`
+                    // (ptrdiff_t), never ID, so the voxel COUNT is not
+                    // bounded by ID. Checked explicitly rather than with
+                    // assert(): an assert compiles out under -DNDEBUG, and an
+                    // id reaching high_bit would silently alias the flag bit.
+                    if ( next_id >= traits::mask )
+                    {
+                        std::cerr << "watershed: segment ids exhausted -- "
+                                  << (next_id-1) << " basins do not fit the "
+                                  << "ID type below its flag bit" << std::endl;
+                        std::abort();
+                    }
                     while ( bfs_start != bfs_end )
                     {
                         seg_raw[ bfs[ bfs_start++ ] ] = traits::high_bit | next_id;

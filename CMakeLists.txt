@@ -113,6 +113,12 @@ add_executable(evaluate
     src/seg/eval.cpp)
 add_executable(ws
     src/ws/atomic_chunk.cpp)
+# Same source as `ws`, built with a 64-bit internal watershed index so a single
+# chunk can exceed 2^31 voxels. `ws` itself is untouched; see the
+# WS_INTERNAL_SEG64 comment in src/ws/atomic_chunk.cpp.
+add_executable(ws64
+    src/ws/atomic_chunk.cpp)
+target_compile_definitions(ws64 PRIVATE WS_INTERNAL_SEG64)
 add_executable(ws2
     src/ws/merge_chunks.cpp)
 add_executable(ws3

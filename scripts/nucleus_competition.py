@@ -677,6 +677,21 @@ def _affinity_fingerprint(value):
         return {"kind": "file", "sha256": _sha256_file(path), "size": path.stat().st_size}
     if not path.is_dir():
         raise FileNotFoundError(f"affinity input does not exist: {path}")
+    info = path / "info"
+    if info.is_file():
+        # A precomputed layer -- what chunked inference writes, and the only form in
+        # which a whole-volume affinity exists when copying it would cost 645 GB.
+        # Fingerprinting the VOXELS is not on offer here: the alternative used for
+        # smaller stores (member names and sizes, _store_member_summary) walks 203k
+        # files over NFS for minutes per run and still hashes no voxel. `info` pins the
+        # geometry, dtype and scale, which is what a frame or resolution mismatch
+        # changes; the layer path pins the rest.
+        return {
+            "kind": "precomputed",
+            "info_file": str(info),
+            "info_sha256": _sha256_file(info),
+            "voxels_hashed": False,
+        }
     candidates = [path / "index.json"]
     if path.name.endswith(".chunks"):
         candidates.append(path.with_name(path.name[: -len(".chunks")] + ".index.json"))

@@ -24,7 +24,25 @@
 #include <ctime>
 #include <boost/format.hpp>
 
+// Internal watershed index type. `ws` keeps the historical uint32_t; the `ws64`
+// target defines WS_INTERNAL_SEG64 to widen it.
+//
+// WHY THIS IS A SWITCH AND NOT JUST A WIDER TYPE. The watershed packs flag bits
+// into the id (watershed_traits<T>::high_bit / visited / dir_mask in types.hpp),
+// so one chunk cannot hold more voxels than `high_bit`. With uint32_t that is a
+// hard 2,147,483,648-voxel ceiling per invocation -- the IST LICONN 18 nm val
+// decode sits at 98.3% of it and the mip0 val volume is 7.8x over. uint64_t
+// lifts the ceiling to 2^63 at the cost of 4 extra bytes per voxel for `seg`
+// (and for `seg_copy` in multi-threshold mode).
+//
+// The ON-DISK FORMAT IS UNAFFECTED either way: relabel_segments() deduces its
+// output type from the uint64 `offset` argument, so the written volume is
+// uint64 regardless of which index type the watershed used internally.
+#ifdef WS_INTERNAL_SEG64
+using internal_seg_t = uint64_t;
+#else
 using internal_seg_t = uint32_t;
+#endif
 
 template <typename IT, typename OT>
 volume_ptr<OT> relabel_segments(volume_ptr<IT> in_ptr, OT offset)

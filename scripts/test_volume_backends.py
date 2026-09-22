@@ -462,6 +462,87 @@ def test_keep_mask_larger_than_the_volume_is_rejected(tmp_path):
         open_volume(str(path)).attach_keep_mask(np.ones((9, 9, 9), dtype="uint8"))
 
 
+def test_keep_mask_ratio_upsamples_a_downsampled_mask(tmp_path):
+    """A 4x8x8 vessel mask is 256x smaller than the volume; it must not need a copy."""
+    data = np.ones((3, 4, 4, 4), dtype="float32")
+    path = tmp_path / "aff.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("main", data=data)
+
+    mask = np.ones((2, 2, 2), dtype="uint8")
+    mask[0, 0, 0] = 0                      # one mask voxel == a 2x2x2 volume block
+    out = np.asarray(
+        open_volume(str(path)).attach_keep_mask(mask, (2, 2, 2))[0:4, 0:4, 0:4]
+    )                                      # (X, Y, Z, C)
+
+    assert np.all(out[:2, :2, :2] == 0), "the whole upsampled cell must be dropped"
+    assert np.all(out[2:] == 1) and np.all(out[:, 2:] == 1) and np.all(out[:, :, 2:] == 1)
+
+
+def test_keep_mask_ratio_reads_the_right_cells_for_an_offset_window(tmp_path):
+    """The window ABISS asks for rarely starts on a mask-cell boundary."""
+    data = np.ones((3, 8, 8, 8), dtype="float32")
+    path = tmp_path / "aff.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("main", data=data)
+
+    mask = np.ones((4, 4, 4), dtype="uint8")
+    mask[1, 1, 1] = 0                      # volume voxels [2:4] on every axis
+    vol = open_volume(str(path)).attach_keep_mask(mask, (2, 2, 2))
+    out = np.asarray(vol[1:6, 1:6, 1:6])   # window offset from the cell grid
+
+    dropped = np.zeros((5, 5, 5), dtype=bool)
+    dropped[1:3, 1:3, 1:3] = True          # volume 2..3 -> window index 1..2
+    assert np.array_equal(out[..., 0] == 0, dropped)
+
+
+def test_keep_mask_one_rounding_cell_past_the_far_face_is_allowed(tmp_path):
+    """ceil(volume / ratio) overhangs by less than one cell; two cells is a frame bug."""
+    data = np.ones((3, 5, 5, 5), dtype="float32")
+    path = tmp_path / "aff.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("main", data=data)
+
+    ok = np.ones((3, 3, 3), dtype="uint8")          # 3 * 2 = 6 covers 5 with rounding
+    open_volume(str(path)).attach_keep_mask(ok, (2, 2, 2))
+    with pytest.raises(ValueError, match="larger than the volume"):
+        open_volume(str(path)).attach_keep_mask(np.ones((4, 4, 4), "uint8"), (2, 2, 2))
+
+
+def test_precomputed_affinity_honours_the_keep_mask(tmp_path):
+    """AFF_KEEP_MASK on a PRECOMPUTED AFF_PATH used to be silently ignored.
+
+    Chunked inference writes precomputed, so this is the configuration a whole-volume
+    decode actually runs in: the config said "masked", the reader returned raw voxels,
+    and the only symptom was a worse segmentation.
+    """
+    from cloudvolume import CloudVolume
+
+    data = np.ones((4, 4, 4, 3), dtype="float32")   # (X, Y, Z, C)
+    cloudpath = "file://" + str(tmp_path / "aff")
+    CloudVolume.from_numpy(
+        data, vol_path=cloudpath, layer_type="image", resolution=(1, 1, 1),
+        voxel_offset=(0, 0, 0), chunk_size=(4, 4, 4), compress=False, progress=False,
+    )
+
+    mask = np.ones((2, 2, 2), dtype="uint8")        # (Z, Y, X) at ratio 2
+    mask[0, 0, 0] = 0
+    mask_path = tmp_path / "keep.h5"
+    with h5py.File(mask_path, "w") as f:
+        f.create_dataset("main", data=mask)
+
+    _param(tmp_path, AFF_PATH=cloudpath, AFF_KEEP_MASK=str(mask_path),
+           AFF_KEEP_MASK_RATIO=[2, 2, 2])
+    out = np.asarray(open_volume(cloudpath)[0:4, 0:4, 0:4])
+    assert np.all(out[:2, :2, :2] == 0)
+    assert out.sum() == data.sum() - 8 * 3
+
+    # ... and a volume that is NOT AFF_PATH must come back untouched.
+    _param(tmp_path, AFF_PATH="file:///somewhere/else", AFF_KEEP_MASK=str(mask_path))
+    assert np.asarray(open_volume(cloudpath)[0:4, 0:4, 0:4]).min() == 1
+    os.environ.pop("PARAM_JSON", None)
+
+
 def test_percent_encoded_file_uri_resolves(tmp_path):
     """`file://` URIs are percent-encoded; the scheme must be UNQUOTED, not just chopped.
 

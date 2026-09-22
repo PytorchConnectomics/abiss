@@ -145,28 +145,24 @@ class _ArrayVolume(object):
                 % (label, tuple(array.shape))
             )
 
-    def attach_keep_mask(self, mask_array):
-        """Zero affinity outside ``mask_array`` (non-zero == keep), 1:1 in (Z, Y, X).
+    def attach_keep_mask(self, mask_array, ratio_zyx=(1, 1, 1)):
+        """Zero affinity outside ``mask_array`` (non-zero == keep), in (Z, Y, X).
 
         The affinity a segmentation pipeline consumes is often masked to tissue
         before use; reading the RAW inference output instead lets segments grow
         through blood vessel / myelin / out-of-bounds and chain neurons together.
         Masking is applied AFTER the convention shift, so a kept voxel still draws
         its edge from the correct source even when that source is masked.
+
+        ``ratio_zyx`` lets the mask sit on a DOWNSAMPLED grid sharing this volume's
+        origin -- one mask voxel covers ``ratio`` volume voxels, nearest-neighbour
+        upsampled at read time. A vessel mask at 4x8x8 is 256x smaller than the
+        volume, so this is the difference between a 5 MB artifact and a
+        full-resolution copy of a 158-Gvoxel volume.
         """
-        expected = tuple(int(v) for v in self._a.shape[-3:])
-        got = tuple(int(v) for v in mask_array.shape[-3:])
-        if len(mask_array.shape) != 3:
-            raise ValueError(
-                "%s: keep-mask must be (Z, Y, X), got %r" % (self._label, tuple(mask_array.shape))
-            )
-        # The mask may be smaller than a chunk-grid-padded volume; it must not be
-        # larger, and every masked read is clipped to its extent (outside == keep,
-        # matching how the reference mask was built).
-        if any(g > e for g, e in zip(got, expected)):
-            raise ValueError(
-                "%s: keep-mask %r is larger than the volume %r" % (self._label, got, expected)
-            )
+        self._mask_ratio = _validate_keep_mask(
+            self._label, self._a.shape[-3:], mask_array, ratio_zyx
+        )
         self._mask = mask_array
         return self
 
@@ -174,16 +170,7 @@ class _ArrayVolume(object):
         """out is (X, Y, Z, C); slices are in volume (Z, Y, X) coordinates."""
         if getattr(self, "_mask", None) is None:
             return out
-        mz, my, mx = (int(v) for v in self._mask.shape[-3:])
-        keep = np.ones(
-            (zs.stop - zs.start, ys.stop - ys.start, xs.stop - xs.start), dtype=bool
-        )
-        z1, y1, x1 = min(zs.stop, mz), min(ys.stop, my), min(xs.stop, mx)
-        if z1 > zs.start and y1 > ys.start and x1 > xs.start:
-            sub = np.asarray(
-                self._mask[zs.start:z1, ys.start:y1, xs.start:x1]
-            ) != 0
-            keep[: z1 - zs.start, : y1 - ys.start, : x1 - xs.start] = sub
+        keep = _keep_block(self._mask, getattr(self, "_mask_ratio", (1, 1, 1)), zs, ys, xs)
         out = out.copy()
         out[np.transpose(~keep, (2, 1, 0))] = 0  # (Z,Y,X) -> (X,Y,Z)
         return out
@@ -709,8 +696,131 @@ def _channels_for(path):
     return [int(c) for c in chans]
 
 
+def _validate_keep_mask(label, volume_zyx, mask_array, ratio_zyx):
+    """Check a keep-mask covers at most ``volume_zyx``; return the validated ratio."""
+    if len(mask_array.shape) != 3:
+        raise ValueError(
+            "%s: keep-mask must be (Z, Y, X), got %r" % (label, tuple(mask_array.shape))
+        )
+    ratio = tuple(int(v) for v in ratio_zyx)
+    if len(ratio) != 3 or any(v < 1 for v in ratio):
+        raise ValueError(
+            "%s: keep-mask ratio must be three positive ints, got %r" % (label, ratio_zyx)
+        )
+    expected = tuple(int(v) for v in volume_zyx)
+    got = tuple(int(v) for v in mask_array.shape[-3:])
+    # The mask may be SMALLER than a chunk-grid-padded volume; every masked read is
+    # clipped to its extent (outside == keep, matching how the reference mask was
+    # built). It must not have a whole mask voxel past the far face: that is what a
+    # mask built in a different frame looks like, and a silently mis-registered mask
+    # produces a plausible segmentation that is wrong everywhere.
+    if any((g - 1) * r >= e for g, r, e in zip(got, ratio, expected)):
+        raise ValueError(
+            "%s: keep-mask %r at ratio %r is larger than the volume %r"
+            % (label, got, ratio, expected)
+        )
+    return ratio
+
+
+def _keep_block(mask, ratio, zs, ys, xs):
+    """Boolean (Z, Y, X) keep block for the volume window ``zs, ys, xs``.
+
+    Outside the mask's extent == keep, so a chunk-grid-padded volume and the
+    rounding cell of a downsampled mask both behave as "not masked out".
+    """
+    starts = (int(zs.start), int(ys.start), int(xs.start))
+    stops = (int(zs.stop), int(ys.stop), int(xs.stop))
+    keep = np.ones(tuple(stops[i] - starts[i] for i in range(3)), dtype=bool)
+    msize = [int(v) for v in mask.shape[-3:]]
+    cells, place = [], []
+    for axis in range(3):
+        r = ratio[axis]
+        c0 = max(0, starts[axis] // r)
+        c1 = min(-(-stops[axis] // r), msize[axis])
+        lo, hi = max(starts[axis], c0 * r), min(stops[axis], c1 * r)
+        if c1 <= c0 or hi <= lo:
+            return keep                      # window lies outside the mask: all keep
+        cells.append((c0, c1))
+        place.append((lo - starts[axis], lo - c0 * r, hi - lo))
+    sub = np.asarray(mask[cells[0][0]:cells[0][1],
+                          cells[1][0]:cells[1][1],
+                          cells[2][0]:cells[2][1]]) != 0
+    for axis in range(3):
+        if ratio[axis] != 1:
+            sub = np.repeat(sub, ratio[axis], axis=axis)
+    sub = sub[place[0][1]:place[0][1] + place[0][2],
+              place[1][1]:place[1][1] + place[1][2],
+              place[2][1]:place[2][1] + place[2][2]]
+    keep[place[0][0]:place[0][0] + place[0][2],
+         place[1][0]:place[1][0] + place[1][2],
+         place[2][0]:place[2][0] + place[2][2]] = sub
+    return keep
+
+
+class _KeepMaskedVolume(object):
+    """A CloudVolume whose reads are keep-masked. Everything else delegates.
+
+    AFF_KEEP_MASK used to be honoured only by the HDF5/zarr adapters, so an AFF_PATH
+    pointing at a PRECOMPUTED affinity -- what chunked inference writes, and what the
+    j0126 config uses after its copy step -- read the volume unmasked while the config
+    said otherwise. The run still completes; the segmentation is just quietly worse
+    (0.045 NERL at whole-volume scale, see the note above the keep-mask tests).
+    """
+
+    def __init__(self, volume, mask, ratio_zyx=(1, 1, 1)):
+        offset = [int(v) for v in getattr(volume, "voxel_offset", (0, 0, 0))]
+        if any(offset):
+            # Reads are in absolute layer coordinates while the mask is indexed from
+            # its own origin, so a non-zero offset would shift the mask by exactly that
+            # much -- masked tissue, unmasked vessel, and nothing to see in the output.
+            raise ValueError(
+                "keep-mask on a layer with voxel_offset %r is not supported: the mask "
+                "would be applied at the wrong origin." % (offset,)
+            )
+        size = [int(v) for v in volume.shape[:3]]          # CloudVolume is (X, Y, Z, C)
+        self._ratio = _validate_keep_mask(
+            str(getattr(volume, "cloudpath", "volume")), size[::-1], mask, ratio_zyx
+        )
+        self._v = volume
+        self._mask = mask
+
+    def __getattr__(self, name):
+        return getattr(self._v, name)
+
+    def __setitem__(self, key, value):
+        self._v[key] = value
+
+    def __getitem__(self, key):
+        out = self._v[key]
+        if not isinstance(key, tuple):
+            key = (key,)
+        spatial = key[:3]
+        if len(spatial) != 3 or not all(isinstance(s, slice) for s in spatial):
+            raise ValueError(
+                "keep-masked reads need three explicit slices (x, y, z), got %r. "
+                "A Bbox or integer index would be masked at the wrong offset." % (key,)
+            )
+        size = [int(v) for v in self._v.shape[:3]]
+        norm = [
+            slice(0 if s.start is None else int(s.start),
+                  size[i] if s.stop is None else int(s.stop))
+            for i, s in enumerate(spatial)
+        ]
+        want = tuple(s.stop - s.start for s in norm)
+        if tuple(int(v) for v in out.shape[:3]) != want:
+            raise ValueError(
+                "keep-mask: read returned %r for a %r window; refusing to mask at a "
+                "guessed offset." % (tuple(out.shape[:3]), want)
+            )
+        keep = _keep_block(self._mask, self._ratio, norm[2], norm[1], norm[0])
+        # CloudVolume allocates a fresh cutout per read, so this is masked in place --
+        # a copy of a whole ABISS chunk is ~18 GB.
+        out[np.transpose(~keep, (2, 1, 0))] = 0            # (Z,Y,X) -> (X,Y,Z)
+        return out
+
+
 def _keep_mask_for(path):
-    """Keep-mask volume for ``path``, from AFF_KEEP_MASK in the ABISS param file.
+    """Keep-mask volume and ratio for ``path``, from AFF_KEEP_MASK in the param file.
 
     Scoped to AFF_PATH exactly like the convention keys: watershed/segmentation
     volumes read through the same backend must not be masked.
@@ -729,23 +839,28 @@ def _keep_mask_for(path):
     mask_path = param.get("AFF_KEEP_MASK")
     if not mask_path:
         return None
+    ratio = param.get("AFF_KEEP_MASK_RATIO", [1, 1, 1])
     raw = _strip_scheme(str(mask_path))
     if raw.endswith(".zarr") or os.path.isdir(raw):
         import zarr
 
-        return zarr.open(raw, mode="r")
+        return zarr.open(raw, mode="r"), ratio
     import h5py
 
     handle = h5py.File(raw, "r", locking=False)
     names = [k for k in handle if isinstance(handle[k], h5py.Dataset)]
     if len(names) != 1:
         raise ValueError("%s: expected exactly one dataset in the keep-mask" % raw)
-    return handle[names[0]]
+    return handle[names[0]], ratio
 
 
 def _with_keep_mask(volume, path):
-    mask = _keep_mask_for(path)
-    return volume if mask is None else volume.attach_keep_mask(mask)
+    spec = _keep_mask_for(path)
+    if spec is None:
+        return volume
+    if hasattr(volume, "attach_keep_mask"):
+        return volume.attach_keep_mask(*spec)
+    return _KeepMaskedVolume(volume, *spec)
 
 
 def open_volume(path, **kwargs):
@@ -821,4 +936,4 @@ def open_volume(path, **kwargs):
         )
     from cloudvolume import CloudVolume
 
-    return CloudVolume(text, **kwargs)
+    return _with_keep_mask(CloudVolume(text, **kwargs), text)

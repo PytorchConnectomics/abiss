@@ -1,11 +1,11 @@
 #pragma once
 
 #include "types.hpp"
+#include "utils.hpp"
 
 #include <boost/pending/disjoint_sets.hpp>
 #include <map>
 #include <vector>
-#include <set>
 #include <iostream>
 
 template<typename C, typename S, typename T>
@@ -37,13 +37,14 @@ inline bool try_merge(C & counts, S & sets, T s1, T s2, size_t size_threshold)
 }
 
 template< typename ID, typename F, typename L, typename M >
-inline void merge_segments( const volume_ptr<ID>& seg_ptr,
-                            region_graph<ID,F>& rg,
+inline std::pair<std::vector<ID>, region_graph<ID,F>>
+compute_merge( const region_graph<ID,F>& rg,
                             std::vector<std::size_t>& counts,
                             const L& tholds,
                             const M& lowt)
 {
     using traits = watershed_traits<id_t>;
+    memory_marker("merge: union begin");
     std::vector<ID> rank(counts.size());
     std::vector<ID> parent(counts.size());
     boost::disjoint_sets<ID*, ID*> sets(&rank[0], &parent[0]);
@@ -51,7 +52,7 @@ inline void merge_segments( const volume_ptr<ID>& seg_ptr,
         sets.make_set(i);
     }
 
-    typename region_graph<ID,F>::iterator rit = rg.begin();
+    auto rit = rg.begin();
 
     std::size_t size = static_cast<std::size_t>(tholds.first);
     //F           thld = static_cast<F>(it.second);
@@ -69,6 +70,7 @@ inline void merge_segments( const volume_ptr<ID>& seg_ptr,
     }
 
     std::cout << "Done with merging" << std::endl;
+    memory_marker("merge: union end / lut begin");
 
     std::vector<ID> remaps(counts.size());
 
@@ -98,24 +100,19 @@ inline void merge_segments( const volume_ptr<ID>& seg_ptr,
 
     counts.resize(next_id);
 
-    std::ptrdiff_t xdim = seg_ptr->shape()[0];
-    std::ptrdiff_t ydim = seg_ptr->shape()[1];
-    std::ptrdiff_t zdim = seg_ptr->shape()[2];
-
-    std::ptrdiff_t total = xdim * ydim * zdim;
-
-    ID* seg_raw = seg_ptr->data();
-
-    for ( std::ptrdiff_t idx = 0; idx < total; ++idx )
-    {
-        seg_raw[idx] = remaps[sets.find_set(seg_raw[idx])];
-    }
+    std::vector<ID> lut(remaps.size());
+    for (size_t id = 0; id < lut.size(); ++id)
+        lut[id] = remaps[sets.find_set(id)];
+    memory_marker("merge: lut end");
+    free_container(rank);
+    free_container(parent);
+    free_container(remaps);
 
     std::cout << "Done with remapping, total: " << (next_id-1) << std::endl;
 
     region_graph<ID,F> new_rg;
 
-    std::vector<std::set<ID>> in_rg(next_id);
+    memory_marker("merge: new graph begin");
 
     std::vector<ID> rank_mst(next_id);
     std::vector<ID> parent_mst(next_id);
@@ -126,8 +123,8 @@ inline void merge_segments( const volume_ptr<ID>& seg_ptr,
 
     for ( auto& it: rg )
     {
-        ID s1 = remaps[sets.find_set(std::get<1>(it))];
-        ID s2 = remaps[sets.find_set(std::get<2>(it))];
+        ID s1 = lut[std::get<1>(it)];
+        ID s2 = lut[std::get<2>(it)];
         ID a1 = mst.find_set(s1);
         ID a2 = mst.find_set(s2);
 
@@ -135,16 +132,12 @@ inline void merge_segments( const volume_ptr<ID>& seg_ptr,
         {
             mst.link(a1, a2);
             auto mm = std::minmax(s1,s2);
-            if ( in_rg[mm.first].count(mm.second) == 0 )
-            {
-                new_rg.emplace_back(std::get<0>(it), mm.first, mm.second);
-                in_rg[mm.first].insert(mm.second);
-            }
+            new_rg.emplace_back(std::get<0>(it), mm.first, mm.second);
         }
     }
 
-    rg.swap(new_rg);
-
+    memory_marker("merge: new graph end");
     std::cout << "Done with updating the region graph, size: "
-              << rg.size() << std::endl;
+              << new_rg.size() << std::endl;
+    return {std::move(lut), std::move(new_rg)};
 }

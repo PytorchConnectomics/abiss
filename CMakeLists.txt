@@ -137,6 +137,9 @@ add_executable(mecs
     src/seg/merge_cs.cpp)
 
 if(BUILD_TESTING)
+    add_executable(test_ws_bfs tests/test_ws_bfs.cpp)
+    target_compile_definitions(test_ws_bfs PRIVATE NDEBUG)
+    add_test(NAME ws_bfs COMMAND test_ws_bfs)
     add_executable(test_nuc_algebra tests/test_nuc_algebra.cpp)
     add_test(NAME nuc_algebra COMMAND test_nuc_algebra)
     add_executable(test_nuc_extractor tests/test_nuc_extractor.cpp)

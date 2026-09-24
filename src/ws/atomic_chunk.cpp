@@ -27,45 +27,23 @@
 // Internal watershed index type. `ws` keeps the historical uint32_t; the `ws64`
 // target defines WS_INTERNAL_SEG64 to widen it.
 //
-// WHY THIS IS A SWITCH AND NOT JUST A WIDER TYPE. The watershed packs flag bits
-// into the id (watershed_traits<T>::high_bit / dir_mask in types.hpp): an
-// unfinished voxel holds direction flags, a finished one `high_bit | segment
-// id`. That bounds the number of SEGMENTS below `high_bit` -- 2^31 for uint32 --
-// and nothing else. Voxels are indexed with ptrdiff_t throughout, so the voxel
-// count is NOT bounded by this type (it once was, by a conservative assert
-// below; see the comment there). uint64_t only matters if a chunk could produce
-// 2^31 basins, and it costs 4 extra bytes per voxel for `seg` (and for
-// `seg_copy` in multi-threshold mode). It stays available as `ws64`, which also
-// serves as the reference that a uint32 decode past 2^31 voxels is checked
-// against.
-//
-// The ON-DISK FORMAT IS UNAFFECTED either way: relabel_segments() deduces its
-// output type from the uint64 `offset` argument, so the written volume is
-// uint64 regardless of which index type the watershed used internally.
+// The watershed packs flag bits into the id (watershed_traits<T>::high_bit /
+// dir_mask in types.hpp): an unfinished voxel holds direction flags, a finished
+// one `high_bit | segment id`. That bounds the number of SEGMENTS below
+// `high_bit` -- 2^31 for uint32 -- and is enforced in watershed() at runtime.
+// Voxels are indexed with ptrdiff_t (and a uint32 BFS queue only when the chunk
+// fits), so the voxel count is NOT bounded by this type. uint64_t only matters
+// if a chunk could produce 2^31 basins; it costs 4 extra bytes per voxel for
+// `seg`. On-disk segmentation width is selected independently by --seg-dtype;
+// boundary segmentation and graph ids remain uint64.
 #ifdef WS_INTERNAL_SEG64
 using internal_seg_t = uint64_t;
 #else
 using internal_seg_t = uint32_t;
 #endif
 
-template <typename IT, typename OT>
-volume_ptr<OT> relabel_segments(volume_ptr<IT> in_ptr, OT offset)
-{
-    auto xdim = in_ptr->shape()[0];
-    auto ydim = in_ptr->shape()[1];
-    auto zdim = in_ptr->shape()[2];
-    size_t chunk_size = xdim * ydim * zdim;
-    auto out_ptr =  volume_ptr<OT>(new volume<OT>(boost::extents[xdim][ydim][zdim], boost::fortran_storage_order()));
-    auto in_data = in_ptr->data();
-    auto out_data = out_ptr->data();
-    for (size_t i = 0; i < chunk_size; i++) {
-        out_data[i] = in_data[i] != 0 ? static_cast<OT>(in_data[i])+offset : 0;
-    }
-    return out_ptr;
-}
-
 template< typename IT, typename OT, typename F>
-region_graph<OT, F> relabel_region_graph(region_graph<IT, F> rg, OT offset)
+region_graph<OT, F> relabel_region_graph(const region_graph<IT, F>& rg, OT offset)
 {
     region_graph<OT, F> new_rg;
     for (auto & e : rg) {
@@ -74,13 +52,32 @@ region_graph<OT, F> relabel_region_graph(region_graph<IT, F> rg, OT offset)
     return new_rg;
 }
 
-int main(int argc, char* argv[])
+int main(int argc, char* argv[]) try
 {
-    // load the ground truth and the affinity graph
+    if (argc < 8) {
+        std::cerr << "Usage: ws param aff high low size dust tag [merge_func] [thresholds...] [--seg-dtype=uint32|uint64]" << std::endl;
+        return 2;
+    }
+    bool output_u32 = false, dtype_seen = false;
+    int retained = 8;
+    for (int i = 8; i < argc; ++i) {
+        std::string token(argv[i]);
+        if (token.rfind("--seg-dtype=", 0) == 0) {
+            if (dtype_seen || (token != "--seg-dtype=uint32" && token != "--seg-dtype=uint64")) {
+                std::cerr << "Invalid or duplicate --seg-dtype token: " << token << std::endl;
+                return 2;
+            }
+            dtype_seen = true;
+            output_u32 = token == "--seg-dtype=uint32";
+        } else {
+            argv[retained++] = argv[i];
+        }
+    }
+    argc = retained;
 
-    size_t xdim,ydim,zdim;
+    size_t xdim = 0, ydim = 0, zdim = 0;
     int flag;
-    seg_t offset;
+    seg_t offset = 0;
     std::ifstream param_file(argv[1]);
     std::string ht(argv[3]);
     std::string lt(argv[4]);
@@ -130,7 +127,18 @@ int main(int argc, char* argv[])
     }
     std::cout << "]" << std::endl;
 
-    param_file >> xdim >> ydim >> zdim;
+    size_t chunk_size;
+    if (!(param_file >> xdim >> ydim >> zdim)
+        || !watershed_size_valid(xdim, ydim, zdim, chunk_size)) {
+        std::cerr << "Invalid chunk size for ws" << sizeof(internal_seg_t)*8
+                  << ": dimension product overflows or exceeds PTRDIFF_MAX" << std::endl;
+        return 2;
+    }
+    std::cout << "Chunk size check passed: " << chunk_size << std::endl;
+    if (xdim < 3 || ydim < 3 || zdim < 3) {
+        std::cerr << "Each dimension must include an interior and two halo voxels" << std::endl;
+        return 2;
+    }
     std::cout << xdim << " " << ydim << " " << zdim << std::endl;
 
 #ifdef USE_MIMALLOC
@@ -152,14 +160,6 @@ int main(int argc, char* argv[])
     param_file >> offset;
     std::cout << "supervoxel id offset:" << offset << std::endl;
 
-    size_t chunk_size = xdim * ydim * zdim;
-
-    // No voxel-count limit here. This used to assert
-    // chunk_size < watershed_traits<internal_seg_t>::high_bit, i.e. 2^31 voxels
-    // for uint32 -- but the watershed indexes voxels with ptrdiff_t, and
-    // internal_seg_t only has to hold SEGMENT ids (plus its flag bit). The real
-    // bound, basins < high_bit, is enforced in watershed() at runtime. A uint32
-    // chunk therefore runs past 2^31 voxels with uint32's memory footprint.
 
     clock_t begin = clock();
     std::array<size_t, 4> aff_dim({xdim,ydim,zdim,3});
@@ -176,7 +176,12 @@ int main(int argc, char* argv[])
     std::vector<std::size_t> counts;
 
     begin = clock();
-    std::tie(seg , counts) = watershed<internal_seg_t>(aff, low_threshold, high_threshold, flags);
+    memory_marker("watershed: begin");
+    if (bfs_fits_u32(chunk_size))
+        std::tie(seg, counts) = watershed<internal_seg_t, uint32_t>(aff, low_threshold, high_threshold, flags);
+    else
+        std::tie(seg, counts) = watershed<internal_seg_t, std::ptrdiff_t>(aff, low_threshold, high_threshold, flags);
+    memory_marker("watershed: end");
     end = clock();
     elapsed_secs = double(end - begin) / CLOCKS_PER_SEC;
     std::cout << "finished watershed in " << elapsed_secs << " seconds" << std::endl;
@@ -186,82 +191,66 @@ int main(int argc, char* argv[])
     elapsed_secs = double(end - begin) / CLOCKS_PER_SEC;
     std::cout << "finished region graph in " << elapsed_secs << " seconds" << std::endl;
 
-    if (merge_thresholds.size() == 1) {
-        // ------ Single merge threshold: original behaviour ------
-        begin = clock();
-        merge_segments(seg, rg, counts, std::make_pair(size_threshold, merge_thresholds[0]), dust_threshold);
-        end = clock();
-        elapsed_secs = double(end - begin) / CLOCKS_PER_SEC;
-
-        auto relabeled_seg = relabel_segments(seg, offset);
-        free_container(seg);
-        auto relabeled_rg = relabel_region_graph(rg, offset);
-        free_container(rg);
-
-        std::cout << "finished agglomeration in " << elapsed_secs << " seconds" << std::endl;
-        auto c = write_counts(counts, offset, tag);
-        free_container(counts);
-        auto d = write_vector(str(boost::format("dend_%1%.data") % tag), relabeled_rg);
-        free_container(relabeled_rg);
-        begin = clock();
-        write_volume(str(boost::format("seg_%1%.data") % tag), relabeled_seg);
-        write_chunk_boundaries(relabeled_seg, aff, flags, tag);
-        std::vector<size_t> meta({xdim,ydim,zdim,c,d,0});
-        write_vector(str(boost::format("meta_%1%.data") % tag), meta);
-        std::cout << "num of sv:" << c << std::endl;
-        std::cout << "size of rg:" << d << std::endl;
-        end = clock();
-        elapsed_secs = double(end - begin) / CLOCKS_PER_SEC;
-        std::cout << "finished writing in " << elapsed_secs << " seconds" << std::endl;
-    } else {
-        // ------ Multiple merge thresholds: reuse watershed + RG ------
+    if (merge_thresholds.size() > 1)
         std::cout << "Multi-threshold mode: " << merge_thresholds.size()
                   << " merge thresholds" << std::endl;
-
-        for (size_t mi = 0; mi < merge_thresholds.size(); mi++) {
-            clock_t mt_begin = clock();
-
-            // Deep-copy seg, rg, counts so merge_segments can modify them
-            auto seg_copy = volume_ptr<internal_seg_t>(
-                new volume<internal_seg_t>(
-                    boost::extents[xdim][ydim][zdim],
-                    boost::fortran_storage_order()));
-            std::copy(seg->data(), seg->data() + chunk_size, seg_copy->data());
-            auto rg_copy = rg;
-            auto counts_copy = counts;
-
-            std::string out_tag = str(boost::format("%1%_%2%") % tag % mi);
-
-            merge_segments(seg_copy, rg_copy, counts_copy,
-                           std::make_pair(size_threshold, merge_thresholds[mi]),
-                           dust_threshold);
-
-            auto relabeled_seg = relabel_segments(seg_copy, offset);
-            free_container(seg_copy);
-            auto relabeled_rg = relabel_region_graph(rg_copy, offset);
-            free_container(rg_copy);
-
-            auto c = write_counts(counts_copy, offset, out_tag.c_str());
-            free_container(counts_copy);
-            auto d = write_vector(str(boost::format("dend_%1%.data") % out_tag), relabeled_rg);
-            free_container(relabeled_rg);
-
-            write_volume(str(boost::format("seg_%1%.data") % out_tag), relabeled_seg);
-            write_chunk_boundaries(relabeled_seg, aff, flags, out_tag.c_str());
-            std::vector<size_t> meta({xdim,ydim,zdim,c,d,0});
-            write_vector(str(boost::format("meta_%1%.data") % out_tag), meta);
-
-            clock_t mt_end = clock();
-            double mt_secs = double(mt_end - mt_begin) / CLOCKS_PER_SEC;
+    for (size_t mi = 0; mi < merge_thresholds.size(); ++mi) {
+        const clock_t mt_begin = clock();
+        begin = clock();
+        memory_marker("merge: counts copy begin");
+        auto merged_counts = counts;
+        auto merged = compute_merge(rg, merged_counts,
+                                    std::make_pair(size_threshold, merge_thresholds[mi]),
+                                    dust_threshold);
+        elapsed_secs = double(clock() - begin) / CLOCKS_PER_SEC;
+        std::cout << "finished agglomeration in " << elapsed_secs << " seconds" << std::endl;
+        const auto& lut = merged.first;
+        const size_t max_id = merged_counts.size()-1;
+        // Check compact labels, not the original watershed LUT length.
+        if (output_u32 && (offset > UINT32_MAX || max_id > UINT32_MAX - offset)) {
+            std::cerr << "uint32 segmentation overflow at threshold " << mi
+                      << ": offset=" << offset << " max_id=" << max_id << std::endl;
+            return 3;
+        }
+        std::string out_tag = merge_thresholds.size() == 1 ? std::string(tag)
+                              : str(boost::format("%1%_%2%") % tag % mi);
+        auto transform = [&lut, offset](internal_seg_t id) -> seg_t {
+            const seg_t v = lut[id];
+            return v == 0 ? 0 : v + offset;
+        };
+        memory_marker("write: begin");
+        auto relabeled_rg = relabel_region_graph(merged.second, offset);
+        free_container(merged.second);
+        auto c = write_counts(merged_counts, offset, out_tag.c_str());
+        free_container(merged_counts);
+        auto d = write_vector(str(boost::format("dend_%1%.data") % out_tag), relabeled_rg);
+        free_container(relabeled_rg);
+        const auto filename = str(boost::format("seg_%1%.data") % out_tag);
+        begin = clock();
+        if (output_u32) write_volume<uint32_t>(filename, seg, transform);
+        else write_volume<seg_t>(filename, seg, transform);
+        memory_marker("write: volume end / faces begin");
+        write_chunk_boundaries(seg, aff, flags, out_tag.c_str(), transform);
+        std::vector<size_t> meta({xdim,ydim,zdim,c,d,0});
+        write_vector(str(boost::format("meta_%1%.data") % out_tag), meta);
+        memory_marker("write: end");
+        std::cout << "num of sv:" << c << std::endl;
+        std::cout << "size of rg:" << d << std::endl;
+        elapsed_secs = double(clock() - begin) / CLOCKS_PER_SEC;
+        std::cout << "finished writing in " << elapsed_secs << " seconds" << std::endl;
+        if (merge_thresholds.size() > 1) {
+            const double mt_secs = double(clock() - mt_begin) / CLOCKS_PER_SEC;
             std::cout << "merge threshold " << mi << " (" << merge_thresholds[mi]
                       << "): sv=" << c << " rg=" << d
                       << " in " << mt_secs << " seconds" << std::endl;
         }
-
-        free_container(seg);
-        free_container(rg);
-        free_container(counts);
     }
 
     return 0;
+}
+catch (const std::exception& error)
+{
+    // Exit 4 reports runtime failures, including streamed output I/O errors.
+    std::cerr << "ws runtime error: " << error.what() << std::endl;
+    return 4;
 }

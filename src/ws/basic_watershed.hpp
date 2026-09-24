@@ -1,6 +1,7 @@
 #pragma once
 
 #include "types.hpp"
+#include "utils.hpp"
 
 #include <iostream>
 
@@ -13,7 +14,7 @@
     CW_FOR_2( type, v1, f1, t1, v2, f2, t2 )                    \
         for ( type v3 = f3; v3 < t3; ++v3 )
 
-template< typename ID, typename F, typename L, typename H >
+template< typename ID, typename Q, typename F, typename L, typename H >
 inline std::tuple< volume_ptr<ID>, std::vector<std::size_t> >
 watershed( const affinity_graph_ptr<F>& aff_ptr, const L& lowv, const H& highv , const std::array<bool,6> & boundary_flags)
 {
@@ -100,7 +101,8 @@ watershed( const affinity_graph_ptr<F>& aff_ptr, const L& lowv, const H& highv ,
 
     id_t next_id = 1;
     {
-        std::vector<index> bfs(size+1,0);
+        memory_marker("watershed: bfs begin");
+        std::vector<Q> bfs;
         index  bfs_index = 0;
         index  bfs_start = 0;
         index  bfs_end   = 0;
@@ -111,7 +113,10 @@ watershed( const affinity_graph_ptr<F>& aff_ptr, const L& lowv, const H& highv ,
 
             if ( !(seg_raw[ idx ] & traits::high_bit) )
             {
-                bfs[ bfs_end++ ] = idx;
+                bfs.clear();
+                bfs_start = bfs_index = bfs_end = 0;
+                bfs.push_back(static_cast<Q>(idx));
+                ++bfs_end;
                 if (seg_raw[idx] == 0) {
                     seg_raw[idx] |= traits::high_bit;
                     bfs_start = bfs_end;
@@ -148,7 +153,8 @@ watershed( const affinity_graph_ptr<F>& aff_ptr, const L& lowv, const H& highv ,
                                     bfs_index = bfs_end;
                                     d = 6; // (break)
                                 }
-                                bfs[ bfs_end++ ] = z;
+                                bfs.push_back(static_cast<Q>(z));
+                                ++bfs_end;
                             }
                         }
                     }
@@ -164,6 +170,9 @@ watershed( const affinity_graph_ptr<F>& aff_ptr, const L& lowv, const H& highv ,
                 }
             }
         }
+        std::cout << "BFS capacity: " << bfs.capacity() << " elements of " << sizeof(Q)
+                  << " bytes" << std::endl;
+        memory_marker("watershed: bfs end");
     }
 
     std::cout << "found: " << (next_id-1) << " components\n";
